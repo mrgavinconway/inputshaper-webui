@@ -1,0 +1,7 @@
+fastapi==0.163.1
+uvicorn==0.54.0
+python-multipart==0.0.34
+numpy==2.5.5
+matplotlib==3.11.2
+zstandard==0.25.0
+GitPython==3.2.1
