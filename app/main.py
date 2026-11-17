@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from datetime import datetime
+from typing import Literal
+from .diagnostics import compare, compatibility, band_power
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
@@ -38,6 +40,7 @@ def init_db():
         c.execute('PRAGMA journal_mode=WAL')
         c.execute('CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, title TEXT, filename TEXT, created REAL, status TEXT, error TEXT, settings TEXT, view TEXT DEFAULT \'{}\')')
         c.execute('CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, run_id TEXT, created REAL, text TEXT, measurement INTEGER, low REAL, high REAL)')
+        c.execute('CREATE TABLE IF NOT EXISTS investigations (id TEXT PRIMARY KEY, created REAL, updated REAL, body TEXT)')
         if 'deleted' not in {r['name'] for r in c.execute('PRAGMA table_info(runs)')}:
             c.execute('ALTER TABLE runs ADD COLUMN deleted REAL')
         c.execute("UPDATE runs SET status='failed', error='Processing interrupted by service restart. Re-upload the original file.' WHERE status IN ('queued','processing')")
@@ -56,16 +59,26 @@ def process(run_id):
     try:
         with (folder / 'processing.log').open('w') as log:
             p = subprocess.run([sys.executable, '-m', 'app.analysis', str(folder),
-                                str(folder / 'settings.json'), str(folder / 'result.json')],
+                                str(folder / 'settings.json'), str(folder / 'result.pending.json')],
                                cwd=ROOT, stdout=log, stderr=log, timeout=600)
         if p.returncode:
             tail = (folder / 'processing.log').read_text(errors='replace').strip().splitlines()[-1:]
             raise ValueError('Analysis failed: ' + ''.join(tail)[-700:])
+        if (folder / 'result.json').exists():
+            import shutil
+            history=folder/'history';history.mkdir(exist_ok=True)
+            shutil.copy2(folder/'result.json', history/f'{time.time_ns()}.json')
+        (folder/'result.pending.json').replace(folder/'result.json')
         with db() as c:
             c.execute("UPDATE runs SET status='ready', error=NULL WHERE id=?", (run_id,))
     except Exception as e:
+        previous_settings=None
+        if (folder/'result.json').exists():
+            previous_settings=json.loads((folder/'result.json').read_text())['settings']
+            (folder/'settings.json').write_text(json.dumps(previous_settings))
         with db() as c:
-            c.execute("UPDATE runs SET status='failed', error=? WHERE id=?", (str(e), run_id))
+            c.execute("UPDATE runs SET status=?, error=? WHERE id=?", ('ready' if (folder/'result.json').exists() else 'failed',str(e), run_id))
+            if previous_settings is not None:c.execute('UPDATE runs SET settings=? WHERE id=?',(json.dumps(previous_settings),run_id))
 
 @asynccontextmanager
 async def lifespan(app):
@@ -139,6 +152,18 @@ def runs(deleted: bool = False):
     with db() as c:
         return [dict(r) for r in c.execute('SELECT id,title,filename,created,status,error,deleted FROM runs WHERE deleted IS '+('NOT NULL' if deleted else 'NULL')+' ORDER BY created DESC')]
 
+@app.get('/api/catalog')
+def catalog():
+    out=[]
+    with db() as c:
+        rows=c.execute("SELECT id,title FROM runs WHERE status='ready' AND deleted IS NULL").fetchall()
+    for r in rows:
+        result=json.loads((DATA/r['id']/'result.json').read_text())
+        out.extend({'run_id':r['id'],'title':r['title'],'measurement':i,'name':m['name'],
+                    'excitation':m.get('excitation','unknown'),'test_type':result.get('test_type','shaper')}
+                   for i,m in enumerate(result['measurements']))
+    return out
+
 def automatic_title(sources):
     for source in sources:
         match = re.search(r'(\d{8})[_-](\d{6})', source['filename'])
@@ -151,10 +176,121 @@ def automatic_title(sources):
     # No trustworthy file timestamp: retain descriptive filenames rather than inventing a test date.
     return ' + '.join(Path(s['filename']).stem for s in sources)[:200]
 
+class TestContext(BaseModel):
+    test_type: Literal['shaper','belts','static','vibrations'] = 'shaper'
+    axis_override: Literal['auto','X','Y','Z','A','B','unknown'] = 'auto'
+    test_mode: str = Field(default='unknown',max_length=120)
+    sensor: str = Field(default='',max_length=120)
+    sensor_mount: str = Field(default='',max_length=200)
+    axes_map: str = Field(default='',max_length=120)
+    position: str = Field(default='',max_length=120)
+    accel_per_hz: str = Field(default='',max_length=50)
+    sweep_rate: str = Field(default='',max_length=50)
+    fans: str = Field(default='',max_length=200)
+    temperature: str = Field(default='',max_length=120)
+    kinematics: Literal['unknown','corexy','corexz','cartesian'] = 'unknown'
+    static_frequency: float | None = Field(default=None,gt=0,le=1000)
+    measurement_axes: list[Literal['auto','X','Y','Z','A','B','unknown']] = Field(default_factory=list,max_length=512)
+
+@app.put('/api/runs/{run_id}/context')
+def context_update(run_id: str, body: TestContext):
+    r=row_run(run_id)
+    if r['status'] in ('processing','queued'):raise HTTPException(409,'Analysis is already running.')
+    if updates().get('status')=='installing':raise HTTPException(409,'Wait for the service update to finish.')
+    settings={**json.loads(r['settings']),**body.model_dump()}
+    (DATA/run_id/'settings.json').write_text(json.dumps(settings))
+    with db() as c:
+        c.execute("UPDATE runs SET settings=?,status='queued',error=NULL WHERE id=?",(json.dumps(settings),run_id))
+    executor.submit(process,run_id)
+    return {'ok':True}
+
+class MeasurementRef(BaseModel):
+    run_id: str = Field(pattern=r'^[a-f0-9]{32}$')
+    measurement: int = Field(default=0,ge=0,le=511)
+
+def resolve_ref(ref):
+    r=row_run(ref.run_id)
+    if r['status']!='ready':raise HTTPException(409,'All selected analyses must be ready.')
+    result=json.loads((DATA/ref.run_id/'result.json').read_text())
+    try:m=result['measurements'][ref.measurement]
+    except IndexError:raise HTTPException(400,'Measurement not found')
+    return m,result['settings'],result['engine']
+
+class CompareRequest(BaseModel):
+    current: MeasurementRef
+    baseline: MeasurementRef
+    low: float = Field(ge=0,le=1000)
+    high: float = Field(gt=0,le=1000)
+    repeats: list[MeasurementRef] = Field(default_factory=list,max_length=10)
+
+@app.post('/api/compare')
+def compare_measurements(body: CompareRequest):
+    a,sa,ea=resolve_ref(body.current);b,sb,eb=resolve_ref(body.baseline)
+    try:result=compare(a,b,sa,sb,body.low,body.high,ea,eb)
+    except ValueError as e:raise HTTPException(400,str(e))
+    result['repeatability']={'count':0,'axes':{},'excluded':[]}
+    if not result['compatibility']['comparable']:return result
+    seen={(body.current.run_id,body.current.measurement)};accepted=[]
+    for ref in [body.baseline,*body.repeats]:
+        key=(ref.run_id,ref.measurement)
+        if key in seen:continue
+        seen.add(key);m,s,e=resolve_ref(ref)
+        check=compatibility(m,b,s,sb,e,eb)
+        # Repeats must match known experimental conditions, not just acquisition settings.
+        differences=[k for k in ('fans','temperature','position','conditions') if s.get(k)!=sb.get(k)]
+        if not check['comparable'] or differences:
+            result['repeatability']['excluded'].append({'ref':ref.model_dump(),'reason':check['blockers']+differences});continue
+        try:accepted.append({axis:band_power(m,body.low,body.high,axis) for axis in ('XYZ','X','Y','Z')})
+        except ValueError as e:result['repeatability']['excluded'].append({'ref':ref.model_dump(),'reason':[str(e)]})
+    result['repeatability']['count']=len(accepted)
+    if len(accepted)>=2:
+        for axis in ('XYZ','X','Y','Z'):
+            values=[x[axis] for x in accepted];mean=sum(values)/len(values)
+            result['repeatability']['axes'][axis]={'mean':mean,'min':min(values),'max':max(values),
+                'current_outside_observed_range':not min(values)<=result['axes'][axis]['after_power']<=max(values)}
+    result['repeatability']['qualification']='Observed baseline range only; not statistical significance. Missing context remains unverified.'
+    return result
+
+class Investigation(BaseModel):
+    title: str = Field(min_length=1,max_length=200)
+    hypothesis: str = Field(default='',max_length=4000)
+    expected: str = Field(default='',max_length=4000)
+    test: str = Field(default='',max_length=4000)
+    observation: str = Field(default='',max_length=4000)
+    conclusion: str = Field(default='',max_length=4000)
+    status: Literal['open','supported','not_supported','inconclusive']='open'
+    references: list[MeasurementRef] = Field(default_factory=list,max_length=30)
+    band: list[float] = Field(default_factory=list,max_length=2)
+
+@app.get('/api/investigations')
+def investigations():
+    with db() as c:return [{'id':r['id'],**json.loads(r['body'])} for r in c.execute('SELECT * FROM investigations ORDER BY updated DESC')]
+
+@app.put('/api/investigations/{investigation_id}')
+def save_investigation(investigation_id: str,body: Investigation):
+    if not re.fullmatch(r'[a-f0-9-]{32,36}',investigation_id):raise HTTPException(400,'Invalid investigation identifier')
+    if body.band and (len(body.band)!=2 or not 0<=body.band[0]<body.band[1]<=1000):raise HTTPException(400,'Invalid frequency band')
+    payload=body.model_dump();payload['evidence_saved_at']=time.time();payload['evidence']=[]
+    for ref in body.references:
+        m,s,e=resolve_ref(ref)
+        snapshot={'reference':ref.model_dump(),'name':m['name'],'settings':s,'engine':e,
+                  'quality':m.get('quality'),'excitation':m.get('excitation'),'peaks':m.get('diagnostic_peaks')}
+        if body.band and m.get('raw_psd'):
+            try:snapshot['band_power']={axis:band_power(m,*body.band,axis) for axis in ('XYZ','X','Y','Z')}
+            except ValueError:snapshot['band_power_status']='Outside this recording’s frequency range'
+        payload['evidence'].append(snapshot)
+    with db() as c:c.execute('INSERT INTO investigations VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET updated=excluded.updated,body=excluded.body',
+                            (investigation_id,time.time(),time.time(),json.dumps(payload)))
+    return {'ok':True}
+
 @app.post('/api/runs', status_code=202)
 async def upload(file: list[UploadFile] = File(...), title: str = Form(''), printer: str = Form(''),
                  conditions: str = Form(''), scv: float = Form(5), max_freq: float = Form(200),
-                 max_smoothing: str = Form('')):
+                 max_smoothing: str = Form(''), context: str = Form('{}')):
+    try:
+        details=TestContext.model_validate_json(context).model_dump()
+    except ValueError as e:
+        raise HTTPException(400, 'Invalid test context: '+str(e)[:300])
     if not 1 <= len(file) <= 2:
         raise HTTPException(400, 'Select one .stdata file or an X/Y pair (maximum two files).')
     if any(not (f.filename or '').lower().endswith('.stdata') for f in file):
@@ -190,7 +326,7 @@ async def upload(file: list[UploadFile] = File(...), title: str = Form(''), prin
         (folder / 'sources.json').write_text(json.dumps(sources))
         filenames = ' + '.join(s['filename'] for s in sources)
         settings = {'scv': scv, 'max_freq': max_freq, 'max_smoothing': smoothing,
-                    'printer': printer[:200], 'conditions': conditions[:4000]}
+                    'printer': printer[:200], 'conditions': conditions[:4000], **details}
         (folder / 'settings.json').write_text(json.dumps(settings))
         with db() as c:
             c.execute('INSERT INTO runs(id,title,filename,created,status,settings) VALUES(?,?,?,?,?,?)',
@@ -244,7 +380,7 @@ def save_view(run_id: str, body: View):
 
 class Note(BaseModel):
     text: str = Field(min_length=1, max_length=10000)
-    measurement: int = Field(default=0, ge=0, le=11)
+    measurement: int = Field(default=0, ge=0, le=511)
     low: float | None = Field(default=None, ge=0, le=1000)
     high: float | None = Field(default=None, ge=0, le=1000)
 
