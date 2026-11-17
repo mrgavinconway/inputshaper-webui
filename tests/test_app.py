@@ -42,3 +42,34 @@ def test_nonmonotonic_rejected(tmp_path):
     f.write_bytes(zstandard.ZstdCompressor().compress(json.dumps({'samples':[[0,1,2,3]]*1024}).encode()))
     with pytest.raises(ValueError, match='strictly increasing'):
         load_measurements(f)
+
+def test_xy_pair_upload_analysis_and_originals(tmp_path):
+    import io
+    import time
+    import zipfile
+    from app.selftest import fixture
+    f = tmp_path / 'recording.stdata'
+    fixture(f)
+    raw = f.read_bytes()
+    with TestClient(app) as client:
+        client.post('/api/login', json={'password':'test-password'})
+        response = client.post('/api/runs', files=[('file', ('inputshaper_X.stdata', raw)), ('file', ('inputshaper_Y.stdata', raw))])
+        assert response.status_code == 202
+        run_id = response.json()['id']
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            saved = client.get('/api/runs/'+run_id).json()
+            if saved['status'] in ('ready', 'failed'):
+                break
+            time.sleep(.2)
+        assert saved['status'] == 'ready', saved.get('error')
+        measurements = saved['result']['measurements']
+        assert [m['source_file'] for m in measurements] == ['inputshaper_X.stdata', 'inputshaper_Y.stdata']
+        assert len(measurements) == 2
+        assert all(len(m['filters']) == 5 for m in measurements)
+        response = client.get('/api/runs/'+run_id+'/source')
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            assert archive.read('1-inputshaper_X.stdata') == raw
+            assert archive.read('2-inputshaper_Y.stdata') == raw
+        assert client.post('/api/runs', files=[('file', ('x.stdata', raw)), ('file', ('y.txt', raw))]).status_code == 400
+        assert client.post('/api/runs', files=[('file', ('x.stdata', raw))]*3).status_code == 400

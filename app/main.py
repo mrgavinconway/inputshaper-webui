@@ -51,7 +51,7 @@ def process(run_id):
         c.execute("UPDATE runs SET status='processing' WHERE id=?", (run_id,))
     try:
         with (folder / 'processing.log').open('w') as log:
-            p = subprocess.run([sys.executable, '-m', 'app.analysis', str(folder / 'source.stdata'),
+            p = subprocess.run([sys.executable, '-m', 'app.analysis', str(folder),
                                 str(folder / 'settings.json'), str(folder / 'result.json')],
                                cwd=ROOT, stdout=log, stderr=log, timeout=600)
         if p.returncode:
@@ -136,11 +136,13 @@ def runs():
         return [dict(r) for r in c.execute('SELECT id,title,filename,created,status,error FROM runs ORDER BY created DESC')]
 
 @app.post('/api/runs', status_code=202)
-async def upload(file: UploadFile = File(...), title: str = Form(''), printer: str = Form(''),
+async def upload(file: list[UploadFile] = File(...), title: str = Form(''), printer: str = Form(''),
                  conditions: str = Form(''), scv: float = Form(5), max_freq: float = Form(200),
                  max_smoothing: str = Form('')):
-    if not (file.filename or '').lower().endswith('.stdata'):
-        raise HTTPException(400, 'Upload a .stdata file')
+    if not 1 <= len(file) <= 2:
+        raise HTTPException(400, 'Select one .stdata file or an X/Y pair (maximum two files).')
+    if any(not (f.filename or '').lower().endswith('.stdata') for f in file):
+        raise HTTPException(400, 'Every selected file must be a .stdata file')
     if not 0 <= scv <= 100 or not 20 <= max_freq <= 1000:
         raise HTTPException(400, 'SCV must be 0–100 and maximum frequency 20–1000 Hz')
     try:
@@ -154,20 +156,29 @@ async def upload(file: UploadFile = File(...), title: str = Form(''), printer: s
     folder.mkdir()
     total = 0
     try:
-        with (folder / 'source.stdata').open('wb') as out:
-            while chunk := await file.read(1024 * 1024):
-                total += len(chunk)
-                if total > 64 * 1024 * 1024:
-                    raise HTTPException(413, 'Upload limit is 64 MiB')
-                out.write(chunk)
-        if total == 0:
-            raise HTTPException(400, 'The file is empty')
+        sources = []
+        for i, uploaded in enumerate(file):
+            stored = 'source.stdata' if len(file) == 1 else f'source-{i}.stdata'
+            size = 0
+            with (folder / stored).open('wb') as out:
+                while chunk := await uploaded.read(1024 * 1024):
+                    size += len(chunk)
+                    total += len(chunk)
+                    if size > 64 * 1024 * 1024:
+                        raise HTTPException(413, 'Each file must be at most 64 MiB')
+                    out.write(chunk)
+            if not size:
+                raise HTTPException(400, 'One of the selected files is empty')
+            original = uploaded.filename.replace('\\', '/').rsplit('/', 1)[-1][:200]
+            sources.append({'stored': stored, 'filename': original})
+        (folder / 'sources.json').write_text(json.dumps(sources))
+        filenames = ' + '.join(s['filename'] for s in sources)
         settings = {'scv': scv, 'max_freq': max_freq, 'max_smoothing': smoothing,
                     'printer': printer[:200], 'conditions': conditions[:4000]}
         (folder / 'settings.json').write_text(json.dumps(settings))
         with db() as c:
             c.execute('INSERT INTO runs(id,title,filename,created,status,settings) VALUES(?,?,?,?,?,?)',
-                      (run_id, (title or file.filename)[:200], file.filename[:200], time.time(), 'queued', json.dumps(settings)))
+                      (run_id, (title or filenames)[:200], filenames, time.time(), 'queued', json.dumps(settings)))
         executor.submit(process, run_id)
         return {'id': run_id}
     except Exception:
@@ -222,7 +233,20 @@ def export(run_id: str):
 @app.get('/api/runs/{run_id}/source')
 def source(run_id: str):
     row_run(run_id)
-    return FileResponse(DATA / run_id / 'source.stdata', filename=f'{run_id}.stdata')
+    folder = DATA / run_id
+    manifest = folder / 'sources.json'
+    sources = json.loads(manifest.read_text()) if manifest.exists() else [{'stored':'source.stdata', 'filename':f'{run_id}.stdata'}]
+    if len(sources) == 1:
+        return FileResponse(folder / sources[0]['stored'], filename=sources[0]['filename'])
+    import io
+    import zipfile
+    from fastapi.responses import Response
+    data = io.BytesIO()
+    with zipfile.ZipFile(data, 'w') as archive:
+        for i, entry in enumerate(sources):
+            archive.write(folder / entry['stored'], arcname=f'{i+1}-{entry["filename"]}')
+    return Response(data.getvalue(), media_type='application/zip',
+                    headers={'Content-Disposition': f'attachment; filename="originals-{run_id[:8]}.zip"'})
 
 def version():
     try:

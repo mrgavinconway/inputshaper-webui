@@ -87,6 +87,23 @@ def analyze(path, settings):
             'samples': len(measurement['samples']), 'max_smoothing_computed': r.max_smoothing_computed}))
     return {'engine': ENGINE, 'settings': settings, 'measurements': results}
 
+def analyze_upload(folder, settings):
+    manifest = folder / 'sources.json'
+    sources = json.loads(manifest.read_text()) if manifest.exists() else [{'stored': 'source.stdata', 'filename': 'source.stdata'}]
+    result = {'engine': ENGINE, 'settings': settings, 'measurements': []}
+    for source in sources:
+        part = analyze(folder / source['stored'], settings)
+        for measurement in part['measurements']:
+            measurement['source_file'] = source['filename']
+            if len(sources) > 1:
+                measurement['name'] = source['filename'] + ' / ' + measurement['name']
+            result['measurements'].append(measurement)
+        if len(result['measurements']) > 12:
+            raise ValueError('Maximum 12 measurements across the selected files.')
+    return result
+
 if __name__ == '__main__':
-    result = analyze(Path(sys.argv[1]), json.loads(Path(sys.argv[2]).read_text()))
+    source = Path(sys.argv[1])
+    settings = json.loads(Path(sys.argv[2]).read_text())
+    result = analyze_upload(source, settings) if source.is_dir() else analyze(source, settings)
     Path(sys.argv[3]).write_text(json.dumps(result, allow_nan=False))
