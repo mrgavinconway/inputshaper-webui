@@ -15,8 +15,8 @@ os.umask(0o022)
 
 BASE = Path('/opt/inputshaper')
 STATE = Path('/var/lib/inputshaper-update')
+DATA = Path('/var/lib/inputshaper')
 REPO = 'https://github.com/mrgavinconway/inputshaper-webui.git'
-STATE.mkdir(parents=True, exist_ok=True)
 
 def command(*args, cwd=None):
     return subprocess.check_output(args, cwd=cwd, stderr=subprocess.STDOUT, text=True, timeout=600).strip()
@@ -51,6 +51,7 @@ def healthy(sha):
     return False
 
 def main():
+    STATE.mkdir(parents=True, exist_ok=True)
     with (STATE / 'lock').open('w') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -64,7 +65,7 @@ def main():
                    message='A new version is ready to install.' if latest != old else 'You are up to date.')
             return
         # Recheck durable queue immediately before installing.
-        dbpath = Path('/var/lib/inputshaper/library.db')
+        dbpath = DATA / 'library.db'
         if dbpath.exists():
             with sqlite3.connect(dbpath) as c:
                 if c.execute("SELECT COUNT(*) FROM runs WHERE status IN ('queued','processing')").fetchone()[0]:
@@ -83,6 +84,11 @@ def main():
         command(python, '-m', 'pip', 'install', '-r', str(release / 'requirements.txt'))
         command(python, '-c', 'import app.analysis; import app.main', cwd=release)
         command(python, '-m', 'app.selftest', cwd=release)
+        if dbpath.exists():
+            with sqlite3.connect(dbpath) as c:
+                if c.execute("SELECT COUNT(*) FROM runs WHERE status IN ('queued','processing')").fetchone()[0]:
+                    status(status='available', latest=latest, available=True, message='A recording was queued during preparation. Finish it before updating.')
+                    return
         previous = (BASE / 'current').resolve() if (BASE / 'current').exists() else None
         command('systemctl', 'stop', 'inputshaper.service')
         backup = STATE / 'pre-update.db'
