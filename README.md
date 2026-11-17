@@ -101,3 +101,9 @@ The repeatability, fan and mounting templates propose controlled experiments. Th
 - Compact rebuildable summary files index history without loading full spectrograms. Originals and complete analyses remain authoritative; cache corruption or unwritable cache storage does not invalidate them.
 
 The supplied 50-record study motivated sampling-screen, coordinate-change and persistent-feature checks. Its original files and private study report are not committed to this repository. Regression tests use deterministic synthetic signals; optional local corpus checks skip when original study files are absent.
+
+## Friendly names and focused results
+
+Use **Rename set** to add or replace a friendly name while retaining the source timestamp and original set label. Clearing the name restores that label. Names appear in the library, search, history and comparison choices; recording IDs, originals, notes, saved views and evidence references remain unchanged. New imports also treat the optional name as a friendly suffix.
+
+Recommended shapers and estimated acceleration limits (mm/s²) appear together at the top, with both directions shown for X/Y pairs. Empty persistence screens and clean timing checks are hidden; actionable quality findings remain visible. Formal investigations are available in a collapsed **Saved investigations** section; ordinary notes and change annotations remain directly accessible.

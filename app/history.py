@@ -120,6 +120,7 @@ def build_records(data, rows):
         for measurement in summary['measurements']:
             info = filename_info(measurement.get('source_file', row.get('filename', '')))
             record = {**measurement, 'run_id': row['id'], 'title': row['title'],
+                      'friendly_name': row.get('friendly_name') or '',
                       'recorded_at': measurement.get('recorded_at') or info['recorded_at'],
                       'recorded_at_source': measurement.get('recorded_at_source') or ('filename; timezone unknown' if info['recorded_at'] else 'unknown'),
                       'source_label': info['source_label'], 'settings': summary['settings'],

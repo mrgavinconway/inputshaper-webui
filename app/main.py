@@ -45,6 +45,9 @@ def init_db():
         c.execute('CREATE TABLE IF NOT EXISTS investigations (id TEXT PRIMARY KEY, created REAL, updated REAL, body TEXT)')
         if 'deleted' not in {r['name'] for r in c.execute('PRAGMA table_info(runs)')}:
             c.execute('ALTER TABLE runs ADD COLUMN deleted REAL')
+        for column in ('base_title', 'friendly_name'):
+            if column not in {r['name'] for r in c.execute('PRAGMA table_info(runs)')}:
+                c.execute(f'ALTER TABLE runs ADD COLUMN {column} TEXT')
         c.execute("UPDATE runs SET status='failed', error='Processing interrupted by service restart. Re-upload the original file.' WHERE status IN ('queued','processing')")
 
 def row_run(run_id):
@@ -183,6 +186,39 @@ def automatic_title(sources):
                 pass
     # No trustworthy file timestamp: retain descriptive filenames rather than inventing a test date.
     return ' + '.join(Path(s['filename']).stem for s in sources)[:200]
+
+
+def run_names(row):
+    """Keep the source timestamp separate from an editable display name."""
+    if row.get('base_title') is not None:
+        return row['base_title'], row.get('friendly_name') or ''
+    try:
+        sources = json.loads((DATA / row['id'] / 'sources.json').read_text(encoding='utf-8'))
+        if not isinstance(sources, list) or not sources or not all(isinstance(s, dict) and isinstance(s.get('filename'), str) for s in sources):
+            raise ValueError('Invalid source manifest')
+    except (OSError, ValueError):
+        sources = [{'filename': name} for name in row['filename'].split(' + ')]
+    base = automatic_title(sources)
+    # Preserve legacy automatic titles, including archive source labels.
+    if row['title'] == base or row['title'].startswith(base + ' · '):
+        return row['title'], ''
+    return base, row['title']
+
+
+class FriendlyName(BaseModel):
+    friendly_name: str = Field(max_length=160)
+
+
+@app.put('/api/runs/{run_id}/name')
+def rename_run(run_id: str, body: FriendlyName):
+    row = row_run(run_id)
+    base, _ = run_names(row)
+    friendly = ' '.join(body.friendly_name.split())
+    title = base + (' · ' + friendly if friendly else '')
+    with db() as connection:
+        connection.execute('UPDATE runs SET title=?,base_title=?,friendly_name=? WHERE id=?',
+                           (title, base, friendly, run_id))
+    return {'id': run_id, 'title': title, 'base_title': base, 'friendly_name': friendly}
 
 class TestContext(BaseModel):
     test_type: Literal['shaper','belts','static','vibrations'] = 'shaper'
@@ -351,8 +387,10 @@ async def upload(file: list[UploadFile] = File(...), title: str = Form(''), prin
                     'printer': printer[:200], 'conditions': conditions[:4000], **details}
         (folder / 'settings.json').write_text(json.dumps(settings))
         with db() as c:
-            c.execute('INSERT INTO runs(id,title,filename,created,status,settings) VALUES(?,?,?,?,?,?)',
-                      (run_id, (title.strip() or automatic_title(sources))[:200], filenames, time.time(), 'queued', json.dumps(settings)))
+            base = automatic_title(sources)
+            friendly = ' '.join(title.split())[:160]
+            c.execute('INSERT INTO runs(id,title,filename,created,status,settings,base_title,friendly_name) VALUES(?,?,?,?,?,?,?,?)',
+                      (run_id, base + (' · ' + friendly if friendly else ''), filenames, time.time(), 'queued', json.dumps(settings), base, friendly))
         executor.submit(process, run_id)
         return {'id': run_id}
     except Exception:
@@ -363,6 +401,7 @@ async def upload(file: list[UploadFile] = File(...), title: str = Form(''), prin
 @app.get('/api/runs/{run_id}')
 def run(run_id: str):
     r = row_run(run_id)
+    r['base_title'], r['friendly_name'] = run_names(r)
     r['settings'] = json.loads(r['settings'])
     r['view'] = json.loads(r['view'])
     with db() as c:

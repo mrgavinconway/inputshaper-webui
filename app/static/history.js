@@ -16,7 +16,7 @@
     // Filename dates have no timezone. Preserve the source's wall-clock time.
     return r.recorded_at ? String(r.recorded_at).replace('T',' ').replace(/\.0+$/, '') : 'Date unknown';
   }
-  const shortLabel = r => `${stamp(r)} · ${r.excitation || '?'} · ${r.source_label || r.title || r.name || 'Recording'}`;
+  const shortLabel = r => `${stamp(r)} · ${r.excitation || '?'} · ${r.friendly_name || r.source_label || r.title || r.name || 'Recording'}`;
   const hasPSD = r => r.quality?.status !== 'invalid' && Array.isArray(r.frequency) && r.frequency.length > 1 && Array.isArray(r.raw_psd?.[h('historyChannel').value]) && r.raw_psd[h('historyChannel').value].length===r.frequency.length;
 
   h('importButton').insertAdjacentHTML('afterend', '<div class="historyNav"><button id="historyButton" class="quiet">▤ Recording history</button><button id="batchImportButton" class="textButton">＋ Import an archive / batch</button></div>');
@@ -110,7 +110,7 @@
     return Number.isFinite(low)&&Number.isFinite(high)&&low>=0&&high>low&&high<=1000 ? [low,high] : null;
   }
   function setShell() {
-    for(const id of ['workspace','empty','pending','deleteImport','contextButton']) h(id)?.classList.add('hidden');
+    for(const id of ['workspace','empty','pending','deleteImport','contextButton','renameImport']) h(id)?.classList.add('hidden');
     h('historyWorkspace').classList.remove('hidden');h('historyButton').classList.add('active');
     h('runTitle').textContent='Recording history';
     h('runMeta').textContent='Follow the evidence across tests, with acquisition changes kept in view.';
@@ -273,7 +273,7 @@
     h('historyRows').innerHTML=[...records].reverse().map(r=>{
       const id=key(r), metric=state.band.get(id), quality=r.quality, selected=state.selected.has(id), available=hasPSD(r);
       const peaks=Array.isArray(metric?.peaks)?metric.peaks:metric?.peaks?.[h('historyChannel').value]||[];
-      return `<tr class="${selected?'selected':''}"><td><input type="checkbox" data-history-select="${esc(id)}" aria-label="Overlay ${esc(shortLabel(r))}" ${selected?'checked':''} ${available?'':'disabled'}></td><td><strong>${esc(stamp(r))}</strong><small>${esc(r.source_label||r.title||r.name)} · ${esc(r.excitation||'unknown')} test</small>${r.duplicate_count>1?`<small>${r.duplicate_count} identical stored copies</small>`:''}</td><td>${metric?.error?`<span class="error" title="${esc(metric.error)}">Unavailable</span>`:power(metric?.power)}${metric?.error?`<small>${esc(metric.error)}</small>`:''}</td><td>${power(metric?.rms)}</td><td>${shareMarkup(metric?.shares)}</td><td>${peaks.length?peaks.map(p=>number(typeof p==='number'?p:p.frequency)).join(', '):metric&&!metric.error?'None detected':'—'}</td><td><span class="historyQuality ${quality?.status==='pass'?'pass':'review'}">${esc(quality?.status||'unchecked')}</span><small>${number(quality?.sample_rate_hz,0)} samples/s · ${number(quality?.resolution_hz,2)} Hz bins</small><small title="${esc(gravityDescription(r))}">${esc(gravityDescription(r))}</small>${quality?.warnings?.length?`<details><summary>Timing notes</summary>${quality.warnings.map(w=>`<p class="hint">${esc(w)}</p>`).join('')}</details>`:''}</td><td>${contextDetails(r)}</td><td><button type="button" class="quiet" data-history-open="${esc(id)}">Open ↗</button></td></tr>`;
+      return `<tr class="${selected?'selected':''}"><td><input type="checkbox" data-history-select="${esc(id)}" aria-label="Overlay ${esc(shortLabel(r))}" ${selected?'checked':''} ${available?'':'disabled'}></td><td><strong>${esc(stamp(r))}</strong><small>${esc(r.friendly_name||r.source_label||r.title||r.name)} · ${esc(r.excitation||'unknown')} test</small>${r.duplicate_count>1?`<small>${r.duplicate_count} identical stored copies</small>`:''}</td><td>${metric?.error?`<span class="error" title="${esc(metric.error)}">Unavailable</span>`:power(metric?.power)}${metric?.error?`<small>${esc(metric.error)}</small>`:''}</td><td>${power(metric?.rms)}</td><td>${shareMarkup(metric?.shares)}</td><td>${peaks.length?peaks.map(p=>number(typeof p==='number'?p:p.frequency)).join(', '):metric&&!metric.error?'None detected':'—'}</td><td><span class="historyQuality ${quality?.status==='pass'?'pass':'review'}">${esc(quality?.status||'unchecked')}</span><small>${number(quality?.sample_rate_hz,0)} samples/s · ${number(quality?.resolution_hz,2)} Hz bins</small><small title="${esc(gravityDescription(r))}">${esc(gravityDescription(r))}</small>${quality?.warnings?.length?`<details><summary>Timing notes</summary>${quality.warnings.map(w=>`<p class="hint">${esc(w)}</p>`).join('')}</details>`:''}</td><td>${contextDetails(r)}</td><td><button type="button" class="quiet" data-history-open="${esc(id)}">Open ↗</button></td></tr>`;
     }).join('');
     h('historyRows').querySelectorAll('[data-history-select]').forEach(el=>el.onchange=()=>{const r=records.find(r=>key(r)===el.dataset.historySelect);if(r)toggleSelection(r);});
     h('historyRows').querySelectorAll('[data-history-open]').forEach(el=>el.onclick=async()=>{
@@ -362,8 +362,8 @@
     h('historyChangeOverlayNote').textContent=`${axis==='XYZ'?'Combined X+Y+Z':axis} · ${data.overlay?.qualification||'Native ordinary PSD on one absolute scale.'}`;
     const layout=plotLayout();layout.yaxis.title={text:'Ordinary PSD ((mm/s²)²/Hz)'};layout.shapes=bandShape();layout.legend={orientation:'h',y:1.13,font:{size:11},itemclick:false,itemdoubleclick:false};
     await Plotly.react('historyChangeOverlay',[
-      {type:'scatter',mode:'lines',x:data.overlay?.baseline?.frequency||[],y:data.overlay?.baseline?.raw_psd?.[axis]||[],name:`Baseline · ${stamp(baseline)}`,line:{color:'#8d74b5',width:2,dash:'dash'}},
-      {type:'scatter',mode:'lines',x:data.overlay?.current?.frequency||[],y:data.overlay?.current?.raw_psd?.[axis]||[],name:`Current · ${stamp(current)}`,line:{color:'#24634c',width:2.5}}
+      {type:'scatter',mode:'lines',x:data.overlay?.baseline?.frequency||[],y:data.overlay?.baseline?.raw_psd?.[axis]||[],name:`Baseline · ${stamp(baseline)}${baseline.friendly_name?" · "+baseline.friendly_name:""}`,line:{color:'#8d74b5',width:2,dash:'dash'}},
+      {type:'scatter',mode:'lines',x:data.overlay?.current?.frequency||[],y:data.overlay?.current?.raw_psd?.[axis]||[],name:`Current · ${stamp(current)}${current.friendly_name?" · "+current.friendly_name:""}`,line:{color:'#24634c',width:2.5}}
     ],layout,plotOptions);
     if(sequence!==state.changeSequence)return;
     const delta=h('historyChangeDelta');
