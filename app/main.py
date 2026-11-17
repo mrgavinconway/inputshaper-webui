@@ -203,12 +203,19 @@ class TestContext(BaseModel):
     intervention: str = Field(default='',max_length=1000)
     measurement_axes: list[Literal['auto','X','Y','Z','A','B','unknown']] = Field(default_factory=list,max_length=512)
 
+
+class ReanalysisContext(TestContext):
+    max_freq: float | None = Field(default=None, ge=20, le=1000, allow_inf_nan=False)
+
+
 @app.put('/api/runs/{run_id}/context')
-def context_update(run_id: str, body: TestContext):
+def context_update(run_id: str, body: ReanalysisContext):
     r=row_run(run_id)
     if r['status'] in ('processing','queued'):raise HTTPException(409,'Analysis is already running.')
     if updates().get('status')=='installing':raise HTTPException(409,'Wait for the service update to finish.')
-    settings={**json.loads(r['settings']),**body.model_dump()}
+    settings={**json.loads(r['settings']),**body.model_dump(exclude={'max_freq'})}
+    if body.max_freq is not None:
+        settings['max_freq']=body.max_freq
     (DATA/run_id/'settings.json').write_text(json.dumps(settings))
     with db() as c:
         c.execute("UPDATE runs SET settings=?,status='queued',error=NULL WHERE id=?",(json.dumps(settings),run_id))

@@ -215,3 +215,47 @@ def test_failed_atomic_cache_replace_preserves_previous_cache(tmp_path, monkeypa
         history.write_summary(tmp_path, result(spectrum('b')))
     assert (tmp_path / 'summary.json').read_bytes() == prior
     assert not list(tmp_path.glob('summary-*.tmp'))
+
+
+@pytest.mark.parametrize('frequency_payload,expected', [({}, 200), ({'max_freq': None}, 200), ({'max_freq': 500}, 500)])
+def test_reanalysis_frequency_control_preserves_recording_evidence(client, monkeypatch, frequency_payload, expected):
+    ref = save_record(spectrum(), {'max_freq': 200, 'scv': 5, 'max_smoothing': .15, 'printer': 'Printer'})
+    run_id = ref['run_id']
+    folder = main.DATA / run_id
+    (folder / 'source.stdata').write_bytes(b'original recording')
+    (folder / 'history').mkdir()
+    (folder / 'history' / 'older.json').write_bytes(b'prior calculation')
+    original_result = (folder / 'result.json').read_bytes()
+    assert client.post(f'/api/runs/{run_id}/notes', json={'text': 'Keep this note', 'measurement': 0}).status_code == 200
+    assert client.put(f'/api/runs/{run_id}/view', json={'view': {'measurement': 0, 'xRange': [10, 100]}}).status_code == 200
+    submitted = []
+    monkeypatch.setattr(main.executor, 'submit', lambda function, ident: submitted.append((function, ident)))
+    monkeypatch.setattr(main, 'updates', lambda: {})
+    response = client.put(f'/api/runs/{run_id}/context', json={'axis_override': 'X', **frequency_payload})
+    assert response.status_code == 200, response.text
+    row = main.row_run(run_id)
+    stored = json.loads(row['settings'])
+    assert stored['max_freq'] == expected
+    assert stored['axis_override'] == 'X'
+    assert stored['scv'] == 5 and stored['max_smoothing'] == .15 and stored['printer'] == 'Printer'
+    assert json.loads((folder / 'settings.json').read_text()) == stored
+    assert row['status'] == 'queued' and submitted == [(main.process, run_id)]
+    assert json.loads(row['view']) == {'measurement': 0, 'xRange': [10, 100]}
+    assert (folder / 'source.stdata').read_bytes() == b'original recording'
+    assert (folder / 'history' / 'older.json').read_bytes() == b'prior calculation'
+    assert (folder / 'result.json').read_bytes() == original_result
+    with main.db() as connection:
+        assert connection.execute('SELECT text FROM notes WHERE run_id=?', (run_id,)).fetchone()['text'] == 'Keep this note'
+    assert 'max_freq' not in main.TestContext.model_fields
+
+
+@pytest.mark.parametrize('maximum', [19.99, 1000.01, 'NaN', 'Infinity', '-Infinity'])
+def test_reanalysis_frequency_control_rejects_out_of_bounds_without_queueing(client, monkeypatch, maximum):
+    ref = save_record(spectrum(), {'max_freq': 200})
+    submitted = []
+    monkeypatch.setattr(main.executor, 'submit', lambda *args: submitted.append(args))
+    response = client.put(f"/api/runs/{ref['run_id']}/context", json={'max_freq': maximum})
+    assert response.status_code == 422
+    row = main.row_run(ref['run_id'])
+    assert row['status'] == 'ready' and json.loads(row['settings'])['max_freq'] == 200
+    assert not submitted

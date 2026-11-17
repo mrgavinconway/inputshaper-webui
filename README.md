@@ -77,7 +77,7 @@ GPL-3.0; see `THIRD_PARTY.md` for analysis-engine revisions and attribution.
 - **Check repeats:** at least two distinct, compatible baselines produce an empirical min/max band-power range. Different recorded acquisition/experimental conditions are excluded. An outside-range observation is not statistical significance. Missing context remains unverified.
 - **Investigate:** record a hypothesis, expected observation, controlled test, result, conclusion and status. Current/baseline/repeat references and a frequency band are linked. Each save captures engine versions, context, quality, peaks and available band powers as an evidence snapshot, preserved until the investigation is saved again.
 
-Older imports can be upgraded with **Test context & re-analyse**. Originals, measurement order and notes are retained. Successful prior results are archived in the run's `history` directory. Failed re-analysis retains the previous results/settings and reports the error. Re-analysis uses the app's pinned engine, not necessarily the printer's original version.
+Older imports can be upgraded with **Test context & re-analyse**, including expanding the maximum analysis frequency without importing another copy. Originals, measurement order and notes are retained. Successful prior results are archived in the run's `history` directory. Failed re-analysis retains the previous results/settings and reports the error. Re-analysis uses the app's pinned engine, not necessarily the printer's original version.
 
 ### Dedicated test views
 
