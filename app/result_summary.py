@@ -57,7 +57,7 @@ def summarize_result(result):
         'measurement_sha256', 'recorded_at', 'recorded_at_source',
         'excitation', 'excitation_source', 'samples', 'quality', 'signal_profile', 'spectral_features',
         'frequency', 'raw_psd', 'diagnostic_peaks', 'resonance', 'damping',
-        'damping_status', 'damping_method', 'profile_angle', 'profile_speed', 'context', 'provenance',
+        'damping_status', 'damping_method', 'choices', 'profile_angle', 'profile_speed', 'context', 'provenance',
     )
     for index, measurement in enumerate(result.get('measurements', [])):
         summary = {key: measurement[key] for key in retained if key in measurement}
@@ -69,7 +69,7 @@ def summarize_result(result):
         summary['recommendations'] = measurement.get('recommendations', [])
         measurements.append(summary)
     return {
-        'summary_version': 1,
+        'summary_version': 2,
         'engine': result.get('engine', {}),
         'settings': result.get('settings', {}),
         'test_type': result.get('test_type', result.get('settings', {}).get('test_type', 'shaper')),

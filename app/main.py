@@ -160,8 +160,14 @@ def health():
 
 @app.get('/api/runs')
 def runs(deleted: bool = False):
+    from .archive_import import filename_info
     with db() as c:
-        return [dict(r) for r in c.execute('SELECT id,title,filename,created,status,error,deleted FROM runs WHERE deleted IS '+('NOT NULL' if deleted else 'NULL')+' ORDER BY created DESC')]
+        rows = [dict(r) for r in c.execute('SELECT id,title,filename,created,status,error,deleted,settings FROM runs WHERE deleted IS '+('NOT NULL' if deleted else 'NULL')+' ORDER BY created DESC')]
+    for row in rows:
+        settings = json.loads(row.pop('settings'))
+        row.update(test_type=settings.get('test_type', 'shaper'), batch_id=settings.get('batch_id'),
+                   recorded_at=filename_info(row['filename'])['recorded_at'])
+    return rows
 
 @app.get('/api/catalog')
 def catalog():
@@ -175,13 +181,14 @@ def catalog():
                    for i,m in enumerate(result['measurements']))
     return out
 
-def automatic_title(sources):
+def automatic_title(sources, test_type='shaper'):
     for source in sources:
         match = re.search(r'(\d{8})[_-](\d{6})', source['filename'])
         if match:
             try:
                 stamp = datetime.strptime(''.join(match.groups()), '%Y%m%d%H%M%S')
-                return stamp.strftime('%d %b %Y, %H:%M:%S') + (' · X/Y pair' if len(sources) == 2 else '')
+                suffix = ' · Belts comparison' if test_type == 'belts' else (' · X/Y pair' if len(sources) == 2 else '')
+                return stamp.strftime('%d %b %Y, %H:%M:%S') + suffix
             except ValueError:
                 pass
     # No trustworthy file timestamp: retain descriptive filenames rather than inventing a test date.
@@ -198,7 +205,7 @@ def run_names(row):
             raise ValueError('Invalid source manifest')
     except (OSError, ValueError):
         sources = [{'filename': name} for name in row['filename'].split(' + ')]
-    base = automatic_title(sources)
+    base = automatic_title(sources, json.loads(row['settings']).get('test_type', 'shaper'))
     # Preserve legacy automatic titles, including archive source labels.
     if row['title'] == base or row['title'].startswith(base + ' · '):
         return row['title'], ''
@@ -387,7 +394,7 @@ async def upload(file: list[UploadFile] = File(...), title: str = Form(''), prin
                     'printer': printer[:200], 'conditions': conditions[:4000], **details}
         (folder / 'settings.json').write_text(json.dumps(settings))
         with db() as c:
-            base = automatic_title(sources)
+            base = automatic_title(sources, details['test_type'])
             friendly = ' '.join(title.split())[:160]
             c.execute('INSERT INTO runs(id,title,filename,created,status,settings,base_title,friendly_name) VALUES(?,?,?,?,?,?,?,?)',
                       (run_id, base + (' · ' + friendly if friendly else ''), filenames, time.time(), 'queued', json.dumps(settings), base, friendly))
@@ -409,6 +416,43 @@ def run(run_id: str):
     if r['status'] == 'ready':
         r['result'] = json.loads((DATA / run_id / 'result.json').read_text())
     return r
+
+
+class BulkImportAction(BaseModel):
+    run_ids: list[str] = Field(min_length=1, max_length=256)
+    action: Literal['delete', 'restore']
+
+
+@app.post('/api/imports/bulk')
+def bulk_import_action(body: BulkImportAction):
+    ids = list(dict.fromkeys(body.run_ids))
+    if any(not re.fullmatch(r'[a-f0-9]{32}', value) for value in ids):
+        raise HTTPException(400, 'Invalid import identifier.')
+    placeholders = ','.join('?' for _ in ids)
+    with db() as connection:
+        connection.execute('BEGIN IMMEDIATE')
+        rows = connection.execute(f'SELECT id,status,deleted FROM runs WHERE id IN ({placeholders})', ids).fetchall()
+        if len(rows) != len(ids):
+            raise HTTPException(404, 'An import no longer exists. Refresh the list; nothing was changed.')
+        if any(row['status'] in ('queued', 'processing') for row in rows):
+            raise HTTPException(409, 'Some selected imports are still analysing. Wait for them to finish; nothing was changed.')
+        if any((row['deleted'] is None) != (body.action == 'delete') for row in rows):
+            raise HTTPException(409, 'Some selected imports have changed since selection. Refresh the list; nothing was changed.')
+        connection.execute(f'UPDATE runs SET deleted=? WHERE id IN ({placeholders})',
+                           [time.time() if body.action == 'delete' else None, *ids])
+    return {'ok': True, 'changed': len(ids), 'action': body.action}
+
+
+@app.get('/api/runs/{run_id}/printer-config')
+def printer_config(run_id: str, x: str | None = None, y: str | None = None, include_damping: bool = True):
+    from .printer_config import build_config
+    row = row_run(run_id)
+    if row['status'] != 'ready':
+        raise HTTPException(409, 'Wait for this analysis to finish.')
+    try:
+        return build_config(read_summary(DATA / run_id), {'X': x, 'Y': y}, include_damping)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
 
 @app.delete('/api/runs/{run_id}')
 def delete_run(run_id: str):
@@ -572,10 +616,12 @@ def recording_changes(body: ChangesRequest):
     return result
 
 
-def create_batch_imports(entries, settings):
+def create_batch_imports(entries, settings, auto_detect=True, friendly_name=''):
     import shutil
-    from .archive_import import group_entries, filename_info
+    from .archive_import import group_entries, filename_info, classify_entries, group_settings
+    entries = classify_entries(entries, settings, auto_detect)
     groups, skipped = group_entries(entries)
+    prepared = [(group, group_settings(group, settings, auto_detect)) for group in groups]
     imports = []
     created = []
     batch_id = uuid.uuid4().hex
@@ -583,7 +629,7 @@ def create_batch_imports(entries, settings):
         try:
             with db() as connection:
                 existing = {}
-                rows = connection.execute("SELECT id,title FROM runs WHERE deleted IS NULL AND status != 'failed'").fetchall()
+                rows = connection.execute("SELECT id,title,settings FROM runs WHERE deleted IS NULL AND status != 'failed'").fetchall()
                 for row in rows:
                     folder = DATA / row['id']
                     manifest = folder / 'sources.json'
@@ -592,9 +638,10 @@ def create_batch_imports(entries, settings):
                         hashes = tuple(sorted(s.get('sha256') or source_digest(folder/s['stored']) for s in sources))
                     except (OSError, ValueError, KeyError):
                         continue  # Retained results without originals cannot establish a source match.
-                    existing[hashes] = dict(row)
-                for group in groups:
-                    signature = tuple(sorted(item['sha256'] for item in group))
+                    previous_settings = json.loads(row['settings'])
+                    existing[(previous_settings.get('test_type', 'shaper'), hashes)] = {'id': row['id'], 'title': row['title'], 'test_type': previous_settings.get('test_type', 'shaper')}
+                for group, inferred_settings in prepared:
+                    signature = (inferred_settings['test_type'], tuple(sorted(item['sha256'] for item in group)))
                     if signature in existing:
                         imports.append({**existing[signature], 'reused': True})
                         continue
@@ -608,15 +655,18 @@ def create_batch_imports(entries, settings):
                         shutil.copyfile(item['path'], folder/stored)
                         sources.append({'stored':stored, 'filename':item['filename'], 'sha256':item['sha256']})
                     info = filename_info(sources[0]['filename'])
-                    run_settings = {**settings, 'batch_id':batch_id, 'source_label':info['source_label']}
-                    title = automatic_title(sources)
-                    if info['source_label'] != 'unlabelled':
+                    run_settings = {**inferred_settings, 'batch_id':batch_id, 'source_label':info['source_label']}
+                    title = automatic_title(sources, run_settings['test_type'])
+                    if info['source_label'] != 'unlabelled' and run_settings['test_type'] != 'belts':
                         title += ' · ' + info['source_label']
+                    base = title[:200]
+                    friendly = ' '.join(friendly_name.split())[:160]
+                    title = base + (' · ' + friendly if friendly else '')
                     (folder/'sources.json').write_text(json.dumps(sources),encoding='utf-8')
                     (folder/'settings.json').write_text(json.dumps(run_settings),encoding='utf-8')
-                    connection.execute('INSERT INTO runs(id,title,filename,created,status,settings) VALUES(?,?,?,?,?,?)',
-                        (run_id,title[:200],' + '.join(s['filename'] for s in sources),time.time(),'queued',json.dumps(run_settings)))
-                    item = {'id':run_id,'title':title[:200]}
+                    connection.execute('INSERT INTO runs(id,title,filename,created,status,settings,base_title,friendly_name) VALUES(?,?,?,?,?,?,?,?)',
+                        (run_id,title,' + '.join(s['filename'] for s in sources),time.time(),'queued',json.dumps(run_settings),base,friendly))
+                    item = {'id':run_id,'title':title,'test_type':run_settings['test_type']}
                     existing[signature] = item
                     imports.append({**item,'reused':False})
         except Exception:
@@ -631,29 +681,33 @@ def create_batch_imports(entries, settings):
 
 @app.post('/api/batch', status_code=202)
 async def batch_upload(file: list[UploadFile] = File(...), printer: str = Form(''), conditions: str = Form(''),
-                       scv: float = Form(5), max_freq: float = Form(500), max_smoothing: str = Form(''), context: str = Form('{}')):
+                       scv: float = Form(5), max_freq: float = Form(500), max_smoothing: str = Form(''), context: str = Form('{}'),
+                       auto_detect: bool = Form(True), title: str = Form('')):
     import tempfile
     from starlette.concurrency import run_in_threadpool
-    from .archive_import import MAX_FILES, MAX_FILE_BYTES, MAX_BATCH_BYTES, stage_archive, entry
+    from .archive_import import MAX_FILES, MAX_FILE_BYTES, MAX_BATCH_BYTES, stage_archive, entry, charge
     try:
         details = TestContext.model_validate_json(context).model_dump()
         smoothing = float(max_smoothing) if max_smoothing else None
         if not 0 <= scv <= 100 or not 20 <= max_freq <= 1000 or (smoothing is not None and not .001 <= smoothing <= 10):
             raise ValueError('Invalid calibration settings.')
         if not 1 <= len(file) <= MAX_FILES:
-            raise ValueError('Choose one .tgz archive or up to 128 .stdata recordings.')
+            raise ValueError('Choose up to 128 recordings or archives.')
         names = [(f.filename or '').replace('\\','/').rsplit('/',1)[-1][:200] for f in file]
-        archive = len(file) == 1 and names[0].lower().endswith(('.tgz','.tar.gz'))
-        if not archive and any(not name.lower().endswith('.stdata') for name in names):
-            raise ValueError('Choose one .tgz archive or a selection of .stdata files.')
+        if any(not name.lower().endswith(('.stdata','.tgz','.tar.gz','.zip')) for name in names):
+            raise ValueError('Choose .stdata, .zip, .tgz or .tar.gz files.')
+        if auto_detect and (details['axis_override'] != 'auto' or details['measurement_axes']):
+            raise ValueError('Automatic mixed import uses recording directions. Use Auto direction or select a manual test type.')
         settings = {'scv':scv,'max_freq':max_freq,'max_smoothing':smoothing,'printer':printer[:200],
                     'conditions':conditions[:4000],**details}
         with tempfile.TemporaryDirectory(prefix='batch-',dir=DATA) as staging:
             staging = Path(staging)
             entries = []
             total = 0
+            budget = {'bytes':0,'files':0}
             for index,uploaded in enumerate(file):
                 target = staging/f'upload-{index}'
+                archive = names[index].lower().endswith(('.zip','.tgz','.tar.gz'))
                 size = 0
                 with target.open('wb') as output:
                     while chunk := await uploaded.read(1024*1024):
@@ -662,9 +716,11 @@ async def batch_upload(file: list[UploadFile] = File(...), printer: str = Form('
                             raise HTTPException(413,'Batch limit: 512 MiB total, 64 MiB per recording.')
                         output.write(chunk)
                 if archive:
-                    entries = await run_in_threadpool(stage_archive,target,staging/'recordings')
+                    staged = await run_in_threadpool(stage_archive,target,staging/f'recordings-{index}',budget)
+                    entries.extend({**item, 'namespace': f'archive-{index}'} for item in staged)
                 else:
+                    charge(budget, size, files=1)
                     entries.append(await run_in_threadpool(entry,target,names[index]))
-            return await run_in_threadpool(create_batch_imports,entries,settings)
+            return await run_in_threadpool(create_batch_imports,entries,settings,auto_detect,title)
     except ValueError as exc:
         raise HTTPException(400,str(exc)[:500])

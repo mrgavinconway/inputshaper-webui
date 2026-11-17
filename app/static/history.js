@@ -83,8 +83,8 @@
   document.body.insertAdjacentHTML('beforeend', `
     <dialog id="batchImportDialog" class="historyBatchDialog"><form id="batchImportForm">
       <div class="sectionHead"><div><span class="eyebrow">BUILD YOUR RECORDING HISTORY</span><h2>Import an archive or batch</h2></div><button type="button" id="batchClose" class="close" aria-label="Close batch import">×</button></div>
-      <p>Choose a .tgz / .tar.gz archive or multiple .stdata files. Matching filename timestamps and excitation directions are paired automatically.</p>
-      <label class="dropzone">Choose recording files<input id="batchFiles" name="file" type="file" accept=".stdata,.tgz,.tar.gz" multiple required><small>Up to 128 recordings · 64 MiB per recording · 512 MiB total</small></label>
+      <p>Choose ZIP / TGZ archives and .stdata files together. X/Y shaper recordings and belt comparisons become separate sets in the same batch. Original belt files containing both directions are supported.</p>
+      <label class="dropzone">Choose recording files<input id="batchFiles" name="file" type="file" accept=".stdata,.zip,.tgz,.tar.gz" multiple required><small>Up to 128 recordings · 64 MiB per recording · 512 MiB total</small></label>
       <p id="batchFileSummary" class="hint" aria-live="polite"></p>
       <label>Printer<input name="printer" maxlength="200" placeholder="Optional — leave unknown if not recorded"></label>
       <div class="formGrid"><label>Square corner velocity<input name="scv" type="number" min="0" max="100" step="any" value="5" required></label><label>Maximum frequency (Hz)<input name="max_freq" type="number" min="20" max="1000" step="any" value="500" required></label><label>Maximum smoothing<input name="max_smoothing" type="number" min="0.001" max="10" step="any" placeholder="Engine default"></label></div>
@@ -97,6 +97,7 @@
       <div id="batchResult" aria-live="polite"></div><p id="batchError" class="error" role="alert"></p>
     </form></dialog>`);
   h('batchContext').innerHTML = typeof contextMarkup === 'function' ? contextMarkup() : '';
+  const batchType=h('batchContext').querySelector('[data-context="test_type"]');batchType.insertAdjacentHTML('afterbegin','<option value="auto" selected>Auto · mixed X/Y, belts and other tests</option>');h('batchFileSummary').insertAdjacentElement('afterend',batchType.closest('label'));
   h('historyContextNotice').insertAdjacentElement('afterend',h('historyChangesCard'));
   h('historyChangesCard').querySelector('.historyChangeSelectors').insertAdjacentElement('beforebegin',h('historyBandForm'));
 
@@ -126,8 +127,9 @@
   };
   const originalTrashToggle=h('trashToggle').onclick;
   h('trashToggle').onclick=async()=>{state.active=false;h('historyWorkspace').classList.add('hidden');h('historyButton').classList.remove('active');await originalTrashToggle();};
+  document.addEventListener('workspacechange',event=>{if(event.detail!=='history'){state.active=false;h('historyWorkspace').classList.add('hidden');h('historyButton').classList.remove('active');}});
   async function openHistory() {
-    state.active=true;setShell();
+    document.dispatchEvent(new CustomEvent('workspacechange',{detail:'history'}));state.active=true;setShell();
     await loadHistory();
     if(state.active) {setShell();await renderHistory();}
   }
@@ -403,7 +405,7 @@
     h('batchFileSummary').textContent=files.length?`${files.length} selected file${files.length===1?'':'s'} · ${number(total/1048576,1)} MiB`:'';
     if(!files.length)return 'Choose an archive or .stdata recordings.';
     if(files.length>128)return 'Choose at most 128 files in one batch.';
-    if(files.some(f=>!/(\.stdata|\.tgz|\.tar\.gz)$/i.test(f.name)))return 'Choose only .stdata, .tgz or .tar.gz files.';
+    if(files.some(f=>!/(\.stdata|\.zip|\.tgz|\.tar\.gz)$/i.test(f.name)))return 'Choose only .stdata, .zip, .tgz or .tar.gz files.';
     if(files.some(f=>/\.stdata$/i.test(f.name)&&f.size>64*1048576))return 'Each .stdata file must be no larger than 64 MiB.';
     if(total>512*1048576)return 'The selected batch exceeds 512 MiB.';
     return '';
@@ -423,14 +425,14 @@
     event.preventDefault();if(state.uploadBusy)return;
     const validation=validateFiles();h('batchError').textContent=validation;if(validation)return;
     const form=event.target,payload=new FormData(form);
-    payload.append('context',JSON.stringify(typeof contextValues==='function'?contextValues(h('batchContext')):{}));
+    const context=typeof contextValues==='function'?contextValues(h('batchContext')):{},automatic=batchType.value==='auto';context.test_type=automatic?'shaper':batchType.value;payload.set('auto_detect',String(automatic));payload.append('context',JSON.stringify(context));
     state.uploadBusy=true;h('batchSubmit').disabled=true;h('batchClose').disabled=true;h('batchFiles').disabled=true;
     h('batchResult').textContent='';h('batchViewHistory').classList.add('hidden');h('batchProgress').classList.remove('hidden');h('batchProgress').value=0;h('batchProgressText').textContent='Uploading recordings…';
     try {
       const result=await uploadBatch(payload), imports=result.imports||[], skipped=result.skipped||[];
       h('batchProgress').value=100;h('batchProgressText').textContent='Upload complete. Analysis runs in the background.';
       h('batchResult').innerHTML=`<p class="historyImportSuccess"><strong>${result.created??imports.filter(r=>!r.reused).length} new imports queued</strong> · ${result.reused??imports.filter(r=>r.reused).length} existing imports reused.</p>${skipped.length?`<details><summary>${skipped.length} skipped archive entries</summary><ul>${skipped.map(entry=>`<li>${esc(typeof entry==='string'?entry:entry.filename?`${entry.filename}: ${entry.reason||entry.error||'Skipped'}`:JSON.stringify(entry))}</li>`).join('')}</ul></details>`:''}`;
-      h('batchViewHistory').classList.remove('hidden');
+      h('batchResult').insertAdjacentHTML('beforeend','<ul>'+imports.map(item=>`<li>${esc(item.title)} · ${esc(item.test_type==='belts'?'Belts comparison':'Input '+(item.test_type||'shaper'))}</li>`).join('')+'</ul>');h('batchViewHistory').classList.remove('hidden');
       await refreshLibrary();await loadHistory();if(state.active)await renderHistory();
     }catch(e){h('batchError').textContent=e.message;h('batchProgressText').textContent='Import did not complete successfully. Your existing recordings are unchanged.';}
     finally {state.uploadBusy=false;h('batchSubmit').disabled=false;h('batchClose').disabled=false;h('batchFiles').disabled=false;}

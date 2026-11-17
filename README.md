@@ -81,7 +81,7 @@ Older imports can be upgraded with **Test context & re-analyse**, including expa
 
 ### Dedicated test views
 
-**Belts:** exactly two A/B recordings, CoreXY/CoreXZ kinematics. Upstream belt curves, shape similarity and paired/unpaired peaks are displayed without equating the similarity score to a mechanical-health verdict or a belt-tension measurement.
+**Belts:** exactly two A/B recordings for CoreXY or X/Z for CoreXZ, including a single original file containing both directions. Upstream belt curves, shape similarity and paired/unpaired peaks are displayed without equating the similarity score to a mechanical-health verdict or a belt-tension measurement.
 
 **Static frequency:** ordinary spectra, per-axis time-frequency views and raw waveforms; no input-shaper fitting. Enter the excitation frequency as context.
 
@@ -92,7 +92,7 @@ The repeatability, fan and mounting templates propose controlled experiments. Th
 
 ## Archive history and observed changes
 
-- Import one `.tgz`/`.tar.gz` or up to 128 `.stdata` files (64 MiB each, 512 MiB total). Archives are staged with bounded gzip expansion and bounded tar metadata; links/traversal are rejected. Matching filename timestamps/prefixes and X/Y directions form pairs. Active identical source pairs are reused; deleted imports stay deleted.
+- Import any mix of `.zip`, `.tgz`, `.tar.gz` and `.stdata` files (128 recordings, 64 MiB each, 512 MiB cumulative expanded total). ZIP directories, archive metadata and expansion are bounded; encrypted ZIPs, links and traversal are rejected. Auto import separates X/Y shaper tests and belt comparisons using recording labels; ambiguous/incomplete belt pairs are rejected before creating any sets. Belt kinematics are inferred from A/B or X/Z labels and can be confirmed in test context. Different archive folders stay separate when pairing. Matching filename timestamps/prefixes and X/Y directions form pairs. Active identical source pairs are reused; deleted imports stay deleted.
 - **Recording history** shows all groups in a relative-shape overview. Filter by excitation, recorded channel and inferred setup group. Grouping uses source labels, approximate sampling rate and apparent gravity direction, not a claim of identical mechanical conditions. Filename timestamps retain unknown timezone.
 - Native-spectrum overlays, display-only interpolated heatmaps and exact native-PSD band integrations serve different purposes. Power/RMS and channel shares are not machine-health scores. Shape normalisation hides amplitude changes and is labelled explicitly.
 - **What changed?** accepts explicit baseline/current recordings. It reports recorded setup changes, qualified band-power/RMS changes, conservative nearby peak matches and unmatched candidates. Compatible recordings receive a signed current-minus-baseline PSD plot on a common frequency grid; interpolation adds no resolution. Incompatible sampling, direction, engine or apparent orientation withholds numerical differences while retaining an exploratory overlay.
@@ -107,3 +107,9 @@ The supplied 50-record study motivated sampling-screen, coordinate-change and pe
 Use **Rename set** to add or replace a friendly name while retaining the source timestamp and original set label. Clearing the name restores that label. Names appear in the library, search, history and comparison choices; recording IDs, originals, notes, saved views and evidence references remain unchanged. New imports also treat the optional name as a friendly suffix.
 
 Recommended shapers and estimated acceleration limits (mm/s²) appear together at the top, with both directions shown for X/Y pairs. Empty persistence screens and clean timing checks are hidden; actionable quality findings remain visible. Formal investigations are available in a collapsed **Saved investigations** section; ordinary notes and change annotations remain directly accessible.
+
+## Managing imports and copying printer settings
+
+**Manage imports** offers search, an inclusive recording-date cutoff, select-visible, and a review of the exact sets before bulk deletion or restoration. The cutoff uses the source filename date; unknown dates are excluded. For example, choose **15 November 2026** to select that day and earlier. Deletion retains original files, notes, saved views and linked evidence. Processing sets cannot be selected. Up to 256 sets can be changed in one atomic operation; stale selections cause no changes.
+
+**Recommended printer.cfg settings** appears below the acceleration cards. Copy the generated `[input_shaper]` block and merge it into the printer’s existing section. Choose between recommended shapers independently for X and Y. Only unique, usable axis recommendations are exported; missing axes and unavailable damping estimates are reported and omitted. Damping estimates are optional, enabled initially; Klipper normally defaults to 0.1 ([configuration reference](https://www.klipper3d.org/Config_Reference.html#input_shaper)). This generates text for review and does not connect to or modify the printer.

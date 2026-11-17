@@ -26,7 +26,7 @@ def write_summary(folder, result):
 
 
 def _valid_summary(summary):
-    return (isinstance(summary, dict) and summary.get('summary_version') == 1
+    return (isinstance(summary, dict) and summary.get('summary_version') == 2
             and isinstance(summary.get('settings'), dict)
             and isinstance(summary.get('engine'), dict)
             and isinstance(summary.get('measurements'), list)

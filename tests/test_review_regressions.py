@@ -155,7 +155,7 @@ def test_corrupt_or_old_cache_is_rebuilt_from_authoritative_result(tmp_path, con
     (tmp_path / 'result.json').write_text(json.dumps(data), encoding='utf-8')
     (tmp_path / 'summary.json').write_text(contents, encoding='utf-8')
     summary = history.read_summary(tmp_path)
-    assert summary['summary_version'] == 1
+    assert summary['summary_version'] == 2
     assert summary['measurements'][0]['name'] == 'axis_X'
     assert json.loads((tmp_path / 'summary.json').read_text(encoding='utf-8')) == summary
 

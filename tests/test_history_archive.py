@@ -1,6 +1,7 @@
 import io
 import json
 import tarfile
+import zstandard
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ def archive_bytes(names):
     buffer=io.BytesIO()
     with tarfile.open(fileobj=buffer,mode='w:gz') as archive:
         for index,name in enumerate(names):
-            payload=b'\x28\xb5\x2f\xfd'+bytes([index])*8
+            payload=zstandard.ZstdCompressor().compress(json.dumps({'name':name,'samples':[]}).encode())
             member=tarfile.TarInfo(name);member.size=len(payload)
             archive.addfile(member,io.BytesIO(payload))
     return buffer.getvalue()
