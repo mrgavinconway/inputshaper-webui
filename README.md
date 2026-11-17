@@ -22,7 +22,7 @@ git clone https://github.com/mrgavinconway/inputshaper-webui.git /tmp/inputshape
 bash /tmp/inputshaper-install/deploy/install.sh
 ```
 
-Open `http://CONTAINER_IP:8080`. The generated app password is in `/etc/inputshaper.env`. The Proxmox account/password is not stored in this application. Access is intended for a trusted LAN; use an HTTPS reverse proxy for access across untrusted networks.
+Open `http://CONTAINER_IP:80`. The generated app password is in `/etc/inputshaper.env`. The Proxmox account/password is not stored in this application. Access is intended for a trusted LAN; use an HTTPS reverse proxy for access across untrusted networks.
 
 ## Import and investigate
 
@@ -52,7 +52,7 @@ To change the app password, edit `/etc/inputshaper.env` and restart `inputshaper
 
 ## Development and verification
 
-Python 3.13 is recommended. Create a virtual environment and install `requirements.txt`; set `INPUTSHAPER_PASSWORD` and optionally `INPUTSHAPER_DATA`, then run `python -m uvicorn app.main:app --port 8080`.
+Python 3.13 is recommended. Create a virtual environment and install `requirements.txt`; set `INPUTSHAPER_PASSWORD` and optionally `INPUTSHAPER_DATA`, then run `python -m uvicorn app.main:app --port 80`.
 
 ```sh
 python -m app.selftest

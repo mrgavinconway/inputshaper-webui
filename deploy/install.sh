@@ -27,9 +27,10 @@ Wants=network-online.target
 [Service]
 User=inputshaper
 Group=inputshaper
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 WorkingDirectory=/opt/inputshaper/current
 EnvironmentFile=/etc/inputshaper.env
-ExecStart=/opt/inputshaper/current/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers 1
+ExecStart=/opt/inputshaper/current/.venv/bin/python -m uvicorn app.main:app --host 0.0.0.0 --port 80 --workers 1
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
@@ -74,4 +75,4 @@ systemctl daemon-reload
 python3 /usr/local/lib/inputshaper/update.py install
 systemctl enable inputshaper.service inputshaper-check.timer
 systemctl start inputshaper-check.timer
-echo 'Input Shaper Lab is listening on port 8080. Password is in /etc/inputshaper.env.'
+echo 'Input Shaper Lab is listening on port 80. Password is in /etc/inputshaper.env.'

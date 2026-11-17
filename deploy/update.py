@@ -41,7 +41,7 @@ def switch(path):
 def healthy(sha):
     for _ in range(30):
         try:
-            with urllib.request.urlopen('http://127.0.0.1:8080/api/health', timeout=2) as r:
+            with urllib.request.urlopen('http://127.0.0.1:80/api/health', timeout=2) as r:
                 health = json.load(r)
                 if health['status'] == 'ok' and health['version'] == sha:
                     return True
