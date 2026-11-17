@@ -3,7 +3,34 @@ import re
 import numpy as np
 
 CONTEXT = ('printer', 'test_type', 'test_mode', 'sensor', 'sensor_mount', 'axes_map',
-           'position', 'accel_per_hz', 'sweep_rate', 'fans', 'temperature', 'kinematics')
+           'position', 'accel_per_hz', 'sweep_rate', 'fans', 'temperature', 'kinematics',
+           'acquisition_group', 'umbilical', 'intervention')
+
+# Screening limits, not sensor specifications. Sparse dropped samples are retained
+# with a caveat; no interpolation or repair is silently applied to the recordings.
+MAX_REVIEW_GAP_PERIODS = 3.0
+MAX_REVIEW_MISSING_FRACTION = .001
+
+
+def signal_profile(a):
+    """Record DC and timing evidence without claiming a calibrated sensor pose."""
+    dc = np.mean(a[:, 1:4], axis=0)
+    norm = float(np.linalg.norm(dc))
+    unit = dc / norm if norm > 0 else np.zeros(3)
+    dominant = int(np.argmax(np.abs(unit)))
+    intervals = np.diff(a[:, 0])
+    return {
+        'dc_acceleration': dict(zip('XYZ', map(float, dc))),
+        'apparent_gravity_norm': norm,
+        'gravity_direction': dict(zip('XYZ', map(float, unit))),
+        'dominant_dc_axis': ('+' if unit[dominant] >= 0 else '-') + 'XYZ'[dominant] if norm > 0 else 'unknown',
+        'gravity_plausible': 6000 <= norm <= 14000,
+        'sample_timing': {'median_interval_s': float(np.median(intervals)),
+                          'mean_interval_s': float(np.mean(intervals)),
+                          'p01_interval_s': float(np.percentile(intervals, 1)),
+                          'p99_interval_s': float(np.percentile(intervals, 99))},
+        'qualification': 'Mean recorded acceleration in assumed mm/s²; apparent gravity is an orientation/mapping clue, not a calibrated pose or sensor identification.',
+    }
 
 def direction(name):
     axes = set(re.findall(r'(?:^|[_\W])([XYZAB])(?=[_\W]|$)', name.upper()))
@@ -12,10 +39,20 @@ def direction(name):
 def quality(a):
     dt = np.diff(a[:, 0]); median = np.median(dt)
     jitter = float(np.percentile(abs(dt / median - 1), 99))
-    gaps = int(np.sum(dt > median * 1.5))
+    periods = dt / median
+    gap_mask = periods > 1.5
+    gaps = int(np.sum(gap_mask))
+    missing = int(np.maximum(np.rint(periods[gap_mask]).astype(np.int64) - 1, 0).sum())
+    missing_fraction = missing / (len(a) + missing)
+    max_gap_periods = float(periods.max())
+    # Timestamp subtraction can put an exact three-period gap a few ulps over
+    # the threshold; this tolerance is far below a meaningful timing difference.
+    invalid = jitter > .2 + 1e-8 or max_gap_periods > MAX_REVIEW_GAP_PERIODS + 1e-6 or missing_fraction > MAX_REVIEW_MISSING_FRACTION
     warnings = []
-    if gaps or jitter > .2:
+    if invalid:
         warnings.append('Irregular sampling: spectra and shaper fitting are withheld. Inspect the waveform and repeat the recording.')
+    elif gaps:
+        warnings.append('Sparse short sampling gaps: spectra retain the original samples using the engine’s uniform-sampling approximation. Treat small changes cautiously; no samples were repaired.')
     flat = []
     for i, axis in enumerate('XYZ', 1):
         y = a[:, i]
@@ -25,9 +62,16 @@ def quality(a):
             flat.append(axis)
     if flat:
         warnings.append('Repeated extrema on '+', '.join(flat)+': possible clipping/quantisation. Sensor limits are unknown; inspect the waveform.')
-    return {'status': 'invalid' if gaps or jitter > .2 else ('review' if warnings else 'pass'),
+    return {'status': 'invalid' if invalid else ('review' if warnings else 'pass'),
             'warnings': warnings, 'sample_rate_hz': float(1 / median), 'duration_s': float(a[-1, 0]-a[0, 0]),
             'largest_gap_ms': float(dt.max()*1000), 'gap_count': gaps,
+            'largest_gap_periods': max_gap_periods, 'estimated_missing_samples': missing,
+            'estimated_missing_fraction': missing_fraction,
+            'mean_sample_rate_hz': float((len(a)-1)/(a[-1,0]-a[0,0])),
+            'sampling_policy': {'max_review_gap_periods': MAX_REVIEW_GAP_PERIODS,
+                                'max_review_missing_fraction': MAX_REVIEW_MISSING_FRACTION,
+                                'max_review_p99_jitter_percent': 20,
+                                'qualification': 'Heuristic screening limits; spectra use original samples without resampling.'},
             'timing_jitter_p99_percent': jitter*100, 'nyquist_hz': float(.5/median),
             'sensor_limit': 'unknown'}
 
@@ -103,15 +147,60 @@ def compatibility(a,b,sa,sb,ea=None,eb=None):
             warnings.append(f'{key}: missing/unknown context')
         elif av!=bv:
             warnings.append(f'{key}: differs ({av} → {bv})')
-            if key in ('printer','test_type','test_mode','sensor','sensor_mount','axes_map','accel_per_hz','sweep_rate'):
+            if key in ('printer','test_type','test_mode','sensor','sensor_mount','axes_map','accel_per_hz','sweep_rate','kinematics','acquisition_group'):
                 blockers.append(f'{key} differs; acquisition conditions are not equivalent.')
+    extra_fields = ['sweep_start_hz', 'sweep_end_hz', 'sweep_duration_s', 'sweep_profile', 'acceleration_units']
+    if sa.get('test_type') == 'static' or sb.get('test_type') == 'static':
+        extra_fields.append('static_frequency')
+    for key in extra_fields:
+        av=sa.get(key); bv=sb.get(key)
+        if av in (None,'','unknown','auto') or bv in (None,'','unknown','auto'):
+            if av is not None or bv is not None or key == 'static_frequency':
+                warnings.append(f'{key}: missing/unknown context')
+        elif av != bv:
+            blockers.append(f'{key} differs; acquisition conditions are not equivalent.')
+    # These parameters are measurement-specific for constant-speed profiles.
+    for key in ('profile_angle', 'profile_speed'):
+        av=a.get(key); bv=b.get(key)
+        if av is not None and bv is not None and av != bv:
+            blockers.append(f'{key} differs; these are different measured profile cells.')
+    for key,label in (('sample_rate_hz','Sample rate'), ('resolution_hz','Frequency-bin spacing')):
+        av=a.get('quality',{}).get(key); bv=b.get('quality',{}).get(key)
+        if av is None or bv is None or av <= 0 or bv <= 0:
+            warnings.append(f'{label}: unrecorded; acquisition equivalence is unverified.')
+            continue
+        relative=abs(av-bv)/max(av,bv)
+        if relative > .02:
+            blockers.append(f'{label} differs by more than 2%; acquisition or spectral resolution changed.')
+        elif relative > .001:
+            warnings.append(f'{label} differs slightly ({bv:.4g} → {av:.4g}); small peak shifts may reflect sampling-clock or frequency-bin changes.')
+    pa=a.get('signal_profile',{}); pb=b.get('signal_profile',{})
+    orientation_change=None
+    if pa.get('gravity_plausible') and pb.get('gravity_plausible'):
+        da=np.array([pa.get('gravity_direction',{}).get(k,0) for k in 'XYZ'])
+        db=np.array([pb.get('gravity_direction',{}).get(k,0) for k in 'XYZ'])
+        if np.linalg.norm(da)>0 and np.linalg.norm(db)>0:
+            orientation_change=float(np.degrees(np.arccos(np.clip(np.dot(da,db)/(np.linalg.norm(da)*np.linalg.norm(db)),-1,1))))
+            if orientation_change > 15:
+                blockers.append('Apparent-gravity direction changed by more than 15°; verify sensor orientation, mounting and axes mapping before comparing axis powers.')
     if ea!=eb:blockers.append('Analysis engine versions differ; re-analyse with the same version.')
     return {'comparable':not blockers,'blockers':blockers,'warnings':warnings,
+            'orientation_change_degrees':orientation_change,
             'qualification':'conditional on missing context' if warnings else 'recorded context matches'}
 
 def band_power(m,low,high,axis):
-    f=np.asarray(m['frequency']);p=np.asarray(m['raw_psd'][axis])
-    if len(f)<2 or low<f[0] or high>f[-1] or high<=low:
+    if m.get('quality',{}).get('status') == 'invalid':
+        raise ValueError('Spectral metrics are unavailable because this recording has invalid sampling.')
+    try:
+        f=np.asarray(m['frequency'], dtype=float)
+        p=np.asarray(m['raw_psd'][axis], dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError('Ordinary PSD is unavailable; re-analyse this recording to enable band metrics.') from exc
+    if (f.ndim != 1 or p.ndim != 1 or len(f) < 2 or len(f) != len(p)
+            or not np.isfinite(f).all() or not np.isfinite(p).all()
+            or not np.all(np.diff(f) > 0) or f[0] < 0 or np.any(p < 0)):
+        raise ValueError('The recorded spectrum is missing or invalid; re-analyse this recording.')
+    if not np.isfinite([low,high]).all() or low<f[0] or high>f[-1] or high<=low:
         raise ValueError('Select a non-empty band inside the common measured frequency range.')
     x=np.r_[low,f[(f>low)&(f<high)],high]
     if high-low<np.median(np.diff(f)):

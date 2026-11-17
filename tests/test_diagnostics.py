@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 import zstandard
 from fastapi.testclient import TestClient
-from app.diagnostics import quality, peaks, match_peaks, compare, reduce_spectrogram
+from app.diagnostics import quality, peaks, match_peaks, compare, reduce_spectrogram, signal_profile, compatibility
+from app.result_summary import measurement_digest, source_digest, measurement_identity, summarize_result
 from app.analysis import analyze, analyze_upload
 from app.selftest import fixture
 from app.main import app, DATA, db
@@ -134,3 +135,109 @@ def test_reanalysis_preserves_notes_history_and_failed_attempt(tmp_path):
         client.put('/api/runs/'+run_id+'/context',json={'test_type':'belts','kinematics':'corexy'})
         r=wait();assert r['status']=='ready' and r['error']
         assert r['result']['test_type']==r['settings']['test_type']=='static'
+
+
+def timing_samples(count=10000):
+    time_axis=np.arange(count)/3300
+    return np.column_stack((time_axis, np.sin(time_axis*100), np.cos(time_axis*110), np.sin(time_axis*120)+9800))
+
+
+def test_sparse_dropped_samples_retain_spectra_with_explicit_caveat():
+    samples=np.delete(timing_samples(), [1500,4500,7500], axis=0)
+    q=quality(samples)
+    assert q['status']=='review'
+    assert q['gap_count']==q['estimated_missing_samples']==3
+    assert q['largest_gap_periods']==pytest.approx(2)
+    assert q['estimated_missing_fraction']==pytest.approx(.0003)
+    assert any('no samples were repaired' in warning for warning in q['warnings'])
+    m=analyze_measurement_for_test(samples)
+    assert m['raw_psd']['XYZ'] and m['frequency']
+
+
+def analyze_measurement_for_test(samples):
+    from app.analysis import analyze_measurement
+    return analyze_measurement({'name':'axis_X','samples':samples},{'test_type':'static','max_freq':200,'scv':5})
+
+
+@pytest.mark.parametrize('drop', [list(range(5000,5004)), list(range(100,9900,50))])
+def test_material_sampling_loss_withholds_spectra(drop):
+    samples=np.delete(timing_samples(),drop,axis=0)
+    assert quality(samples)['status']=='invalid'
+    assert analyze_measurement_for_test(samples)['frequency']==[]
+
+
+def test_timing_jitter_without_long_gaps_is_invalid():
+    samples=timing_samples()
+    samples[:,0]=np.cumsum(np.resize([.7,1.3],len(samples)))/3300
+    q=quality(samples)
+    assert q['gap_count']==0 and q['status']=='invalid'
+
+
+def test_sampling_and_static_acquisition_conditions_are_compared():
+    a=spectrum();b=spectrum()
+    a['quality'].update(sample_rate_hz=3300,resolution_hz=1.611)
+    b['quality'].update(sample_rate_hz=3301,resolution_hz=1.612)
+    assert compatibility(a,b,{},{})['comparable']
+    b['quality']['sample_rate_hz']=1000
+    assert any('Sample rate' in reason for reason in compatibility(a,b,{},{})['blockers'])
+    b['quality']['sample_rate_hz']=3300;b['quality']['resolution_hz']=3.2
+    assert any('Frequency-bin spacing' in reason for reason in compatibility(a,b,{},{})['blockers'])
+    b['quality']['resolution_hz']=1.611
+    assert not compatibility(a,b,{'test_type':'static','static_frequency':40},
+                             {'test_type':'static','static_frequency':80})['comparable']
+    a['profile_speed']=100;b['profile_speed']=150
+    assert any('profile_speed' in reason for reason in compatibility(a,b,{},{})['blockers'])
+
+
+def test_apparent_gravity_mapping_change_blocks_axis_comparison():
+    samples=timing_samples()
+    a=spectrum();b=spectrum()
+    a['signal_profile']=signal_profile(samples)
+    changed=samples.copy();changed[:,[2,3]]=changed[:,[3,2]]
+    b['signal_profile']=signal_profile(changed)
+    check=compatibility(a,b,{},{})
+    assert a['signal_profile']['dominant_dc_axis']=='+Z'
+    assert b['signal_profile']['dominant_dc_axis']=='+Y'
+    assert not check['comparable']
+    assert check['orientation_change_degrees']==pytest.approx(90,abs=.01)
+    assert compatibility(a,a,{},{})['orientation_change_degrees']==pytest.approx(0)
+    # A near-zero mean is not evidence of a known gravity direction.
+    b['signal_profile']=signal_profile(samples*np.array([1,1,1,0]))
+    assert not b['signal_profile']['gravity_plausible']
+    assert compatibility(a,b,{},{})['comparable']
+
+
+def test_recording_fingerprint_tracks_samples_not_names_or_container(tmp_path):
+    samples=timing_samples(2000)
+    digest=measurement_digest(samples)
+    assert measurement_digest(samples.tolist())==digest
+    assert measurement_digest(samples.astype('>f8'))==digest
+    shifted=samples.copy();shifted[:,0]+=1
+    assert measurement_digest(shifted)!=digest
+    altered=samples.copy();altered[100,1]+=.01
+    assert measurement_digest(altered)!=digest
+    a={'measurement_sha256':digest,'source_file':'old.stdata'}
+    b={'measurement_sha256':digest,'source_file':'renamed.stdata'}
+    assert measurement_identity(a)==measurement_identity(b)
+    assert measurement_identity({'source_sha256':digest,'source_measurement_index':0})!=measurement_identity({'source_sha256':digest,'source_measurement_index':1})
+    assert measurement_identity({'name':'legacy'}) is None
+    path=tmp_path/'source';path.write_bytes(b'recording')
+    import hashlib
+    assert source_digest(path)==hashlib.sha256(b'recording').hexdigest()
+
+
+def test_summary_preserves_comparison_evidence_omits_heavy_plot_arrays():
+    measurement=spectrum()
+    measurement.update(waveform={'time':[1]},spectrogram={'power_db':[[1]]},
+                       spectrograms={'XYZ':{'power_db':[[1]]}},
+                       filters=[{'type':'MZV','frequency':42,'vals':[1,2]}],
+                       signal_profile=signal_profile(timing_samples()),
+                       measurement_sha256='a'*64,recorded_at='2026-11-17T12:00:00')
+    source={'settings':{'test_type':'shaper'},'engine':{'adapter':2},'measurements':[measurement]}
+    result=summarize_result(source);saved=result['measurements'][0]
+    assert saved['frequency']==measurement['frequency'] and saved['raw_psd']==measurement['raw_psd']
+    assert saved['signal_profile']==measurement['signal_profile']
+    assert saved['measurement_sha256']=='a'*64 and saved['measurement']==0
+    assert saved['filters']==[{'type':'MZV','frequency':42}]
+    assert not {'waveform','spectrogram','spectrograms','psd'}.intersection(saved)
+    assert compare(saved,saved,{},{},20,90)['axes']['XYZ']['change_percent']==pytest.approx(0)

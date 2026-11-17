@@ -2,11 +2,15 @@
 import io
 import json
 import os
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import zstandard as zstd
+from .result_summary import measurement_digest, source_digest
+from .spectral_features import persistent_spectral_features
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'vendor'))
@@ -18,8 +22,30 @@ sys.modules['shaper_defs'] = shaper_defs
 from shaketune.graph_creators.computations.shaper_computation import ShaperComputation
 
 ENGINE = {'shaketune': '354ee4be6db218715239f7b9411c2c37fdea23dd',
-          'klipper': '29d4ec2d6d840ee839333306003a400da186d41d', 'adapter': 2}
+          'klipper': '29d4ec2d6d840ee839333306003a400da186d41d', 'adapter': 3}
 MAX_DECOMPRESSED = 256 * 1024 * 1024
+
+
+def recording_timestamp(filename, measurement_name):
+    """Keep recorder-local wall-clock text; neither filenames nor samples supply a timezone."""
+    for text, label in ((filename, 'source filename'), (measurement_name, 'measurement name')):
+        for match in re.finditer(r'(?<!\d)(\d{8})[_-](\d{6})(?!\d)', text):
+            try:
+                stamp = datetime.strptime(''.join(match.groups()), '%Y%m%d%H%M%S')
+            except ValueError:
+                continue
+            return stamp.isoformat(), label + ' (inferred; timezone unknown)'
+    return None, 'unrecorded'
+
+
+def validate_shaper_recording(measurement, settings):
+    if settings.get('test_type','shaper') != 'shaper':
+        return
+    names = (measurement['name'], measurement.get('source_file',''))
+    pattern = r'(?:^|[^a-z0-9])(?:vib|vibrations|belt|belts|axesmap|staticfreq|staticfrequency)(?:_|\W|$)'
+    if any(re.search(pattern, name.lower()) for name in names):
+        raise ValueError('This recording appears to be a vibration, belt, static-frequency or axes-map test, not an input-shaper sweep. Choose its dedicated analysis type; axes-map calibration is not supported here.')
+
 
 def load_measurements(path):
     with open(path, 'rb') as f:
@@ -31,6 +57,7 @@ def load_measurements(path):
     if len(raw) > MAX_DECOMPRESSED:
         raise ValueError('Decompressed file exceeds 256 MiB limit.')
     measurements = []
+    file_digest = source_digest(path)
     for line in raw.splitlines():
         if not line.strip():
             continue
@@ -45,7 +72,12 @@ def load_measurements(path):
         rate = len(a) / (a[-1, 0] - a[0, 0])
         if not 100 <= rate <= 100000:
             raise ValueError('Sample rate is outside the supported range.')
-        measurements.append({'name': str(m.get('name', 'Measurement'))[:200], 'samples': a})
+        name = str(m.get('name', 'Measurement'))[:200]
+        recorded_at, recorded_at_source = recording_timestamp(Path(path).name, name)
+        measurements.append({'name': name, 'samples': a, 'source_file': Path(path).name,
+                             'source_sha256': file_digest, 'source_measurement_index': len(measurements),
+                             'measurement_sha256': measurement_digest(a),
+                             'recorded_at': recorded_at, 'recorded_at_source': recorded_at_source})
         if len(measurements) > 512:
             raise ValueError('Maximum 512 measurements per upload.')
     if not measurements:
@@ -66,17 +98,22 @@ def plain(value):
     return value
 
 def analyze_measurement(measurement, settings):
-    from .diagnostics import quality, waveform, reduce_spectrogram, peaks, direction
+    from .diagnostics import quality, waveform, reduce_spectrogram, peaks, direction, signal_profile
     from shaketune.helpers.spectrogram import compute_spectrogram
     from shaketune.helpers.common_func import compute_mechanical_parameters
+    validate_shaper_recording(measurement,settings)
     a=measurement['samples']; kind=settings.get('test_type','shaper'); q=quality(a)
     axis=settings.get('axis_override') or direction(measurement['name'])
     if axis=='auto': axis=direction(measurement['name'])
     base={'name':measurement['name'], 'excitation':axis, 'excitation_source':'user' if settings.get('axis_override') not in (None,'','auto') else 'measurement name (inferred)',
-          'samples':len(a), 'quality':q, 'waveform':waveform(a) if kind!='vibrations' else None,
+          'samples':len(a), 'quality':q, 'signal_profile':signal_profile(a),
+          'measurement_sha256':measurement.get('measurement_sha256') or measurement_digest(a),
+          'waveform':waveform(a) if kind!='vibrations' else None,
           'frequency':[], 'psd':{k:[] for k in ('XYZ','X','Y','Z')}, 'raw_psd':{},
           'filters':[], 'choices':[], 'recommendations':[], 'resonance':None, 'damping':None,
-          'damping_status':'unavailable', 'regions':{'relax':None,'warning':None},'peaks':[], 'spectrogram':None,'spectrograms':{}}
+          'damping_status':'unavailable', 'damping_method':'unavailable',
+          'regions':{'relax':None,'warning':None},'peaks':[], 'spectrogram':None,'spectrograms':{}}
+    base.update({key:measurement[key] for key in ('source_file','source_sha256','source_measurement_index','recorded_at','recorded_at_source') if key in measurement})
     if q['status']=='invalid':return base
     calculator=shaper_calibrate.ShaperCalibrate(printer=None)
     calibration=calculator.process_accelerometer_data(measurement['name'],a)
@@ -93,6 +130,7 @@ def analyze_measurement(measurement, settings):
             power,times,frequencies=compute_spectrogram(single)
             total=power.copy() if total is None else total+power
             maps[axis_name]=reduce_spectrogram(power,times,frequencies,settings['max_freq'])
+        base['spectral_features']=persistent_spectral_features(total,times,frequencies,settings['max_freq'])
         maps['XYZ']=reduce_spectrogram(total,times,frequencies,settings['max_freq'])
         base.update(spectrograms=maps,spectrogram=maps['XYZ'])
     calibration.normalize_to_frequencies()
@@ -102,6 +140,7 @@ def analyze_measurement(measurement, settings):
         r=ShaperComputation([measurement],settings.get('max_smoothing'),settings['scv'],settings['max_freq'],None,None,ENGINE['shaketune'][:12]).compute()
         base.update(filters=r.shaper_table_data['shapers'],choices=r.shaper_choices,recommendations=r.shaper_table_data['recommendations'],
                     resonance=r.fr,damping=r.zeta,damping_status='estimated' if estimated is not None and np.isfinite(estimated) else 'default (estimation failed)',
+                    damping_method='Pinned Shake&Tune engine estimate from frequency-normalised PSD using peak/√2 crossings; a shaper-fitting heuristic, not measured physical damping.',
                     regions={'relax':r.peaks_threshold[0],'warning':r.peaks_threshold[1]},
                     peaks=[{'frequency':f,'power':r.calibration_data.psd_sum[i]} for i,f in zip(r.peaks,r.peaks_freqs)],
                     max_smoothing_computed=r.max_smoothing_computed)
@@ -112,20 +151,19 @@ def analyze_measurement(measurement, settings):
 
 
 def analyze(path, settings):
-    return {'engine':ENGINE,'settings':settings,'measurements':[analyze_measurement(m,settings) for m in load_measurements(path)]}
+    return {'engine':ENGINE,'settings':settings,'test_type':settings.get('test_type','shaper'),'measurements':[analyze_measurement(m,settings) for m in load_measurements(path)]}
 
 
 def analyze_upload(folder, settings):
     from .diagnostics import direction, band_power
-    import re
     manifest=folder/'sources.json'
     sources=json.loads(manifest.read_text()) if manifest.exists() else [{'stored':'source.stdata','filename':'source.stdata'}]
     kind=settings.get('test_type','shaper'); result={'engine':ENGINE,'settings':settings,'measurements':[],'test_type':kind}
     originals=[]
     for source in sources:
         for measurement in load_measurements(folder/source['stored']):
-            if kind=='shaper' and any(token in measurement['name'].lower() for token in ('staticfreq','vibrations','belts_')):
-                raise ValueError('This recording appears to be another test type. Choose its dedicated analysis type in test context.')
+            measurement['source_file']=source['filename']
+            measurement['recorded_at'],measurement['recorded_at_source']=recording_timestamp(source['filename'],measurement['name'])
             # A filename can supply direction when the inner name has none.
             inner_axis=direction(measurement['name']);file_axis=direction(source['filename'])
             derived=dict(settings)
@@ -143,8 +181,10 @@ def analyze_upload(folder, settings):
             if len(originals)>512:raise ValueError('Maximum 512 measurements per import.')
     if kind=='belts':
         if settings.get('kinematics') not in ('corexy','corexz'):raise ValueError('Belt comparison requires CoreXY or CoreXZ kinematics.')
-        if len(originals)!=2:raise ValueError('Belt comparison requires exactly two belt recordings (A and B).')
-        if {m['excitation'] for m in result['measurements']}!={'A','B'}:raise ValueError('Belt recordings must identify distinct A and B directions in their names.')
+        expected={'X','Z'} if settings['kinematics']=='corexz' else {'A','B'}
+        labels='X and Z' if settings['kinematics']=='corexz' else 'A and B'
+        if len(originals)!=2:raise ValueError(f'Belt comparison requires exactly two belt recordings ({labels}).')
+        if {m['excitation'] for m in result['measurements']}!=expected:raise ValueError(f'Belt recordings must identify distinct {labels} directions for the selected kinematics.')
         if any(m['quality']['status']=='invalid' for m in result['measurements']):
             result['belt_analysis']={'error':'Invalid sampling; belt metrics withheld.'}
         else:
@@ -161,6 +201,7 @@ def analyze_upload(folder, settings):
             match=re.search(r'an(\d+)_([0-9]+)sp(\d+)_([0-9]+)',original['name'])
             if not match:raise ValueError('Vibration-profile recordings must contain angle/speed names such as an45_0sp100_0.')
             angle=float(match[1]+'.'+match[2]);speed=float(match[3]+'.'+match[4])
+            m.update(profile_angle=angle,profile_speed=speed)
             power={axis:band_power(m,m['frequency'][0],m['frequency'][-1],axis) for axis in ('XYZ','X','Y','Z')} if m['raw_psd'] else None
             cells.append({'angle':angle,'speed':speed,'power':power,'measurement':len(cells)})
         result['vibration_profile']={'cells':cells,'qualification':'Measured speed/angle cells only; no interpolation into unmeasured directions or automatic fault identification.'}
