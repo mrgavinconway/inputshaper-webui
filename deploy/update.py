@@ -11,6 +11,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+os.umask(0o022)
+
 BASE = Path('/opt/inputshaper')
 STATE = Path('/var/lib/inputshaper-update')
 REPO = 'https://github.com/mrgavinconway/inputshaper-webui.git'

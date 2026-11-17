@@ -18,6 +18,7 @@ print('INPUTSHAPER_DATA=/var/lib/inputshaper')
 print('MPLCONFIGDIR=/var/lib/inputshaper/matplotlib')
 PY
 fi
+umask 022
 cat > /etc/systemd/system/inputshaper.service <<'EOF'
 [Unit]
 Description=Input Shaper Lab
