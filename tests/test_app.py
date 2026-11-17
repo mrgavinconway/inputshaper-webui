@@ -25,6 +25,12 @@ def test_auth_csrf_and_persistence():
         assert saved['notes'][0]['text'] == note['text']
         assert saved['view'] == view
         assert client.get('/api/runs/test/export').json()['view'] == view
+        assert client.delete('/api/runs/test').status_code == 200
+        assert not any(r['id']=='test' for r in client.get('/api/runs').json())
+        assert any(r['id']=='test' for r in client.get('/api/runs?deleted=true').json())
+        assert client.post('/api/runs/test/restore').status_code == 200
+        restored=client.get('/api/runs/test').json()
+        assert restored['view']==view and restored['notes'][0]['text']==note['text']
         assert client.get('/api/runs/missing').status_code == 404
         assert client.post('/api/runs', files={'file':('bad.txt',b'bad')}).status_code == 400
         assert client.post('/api/logout').status_code == 200
@@ -73,3 +79,10 @@ def test_xy_pair_upload_analysis_and_originals(tmp_path):
             assert archive.read('2-inputshaper_Y.stdata') == raw
         assert client.post('/api/runs', files=[('file', ('x.stdata', raw)), ('file', ('y.txt', raw))]).status_code == 400
         assert client.post('/api/runs', files=[('file', ('x.stdata', raw))]*3).status_code == 400
+
+def test_automatic_titles():
+    from app.main import automatic_title
+    assert automatic_title([{'filename':'inputshaper_X_20261117_065959.stdata'}]) == '17 Nov 2026, 06:59:59'
+    assert automatic_title([{'filename':'inputshaper_X_20261117_065959.stdata'}, {'filename':'inputshaper_Y_20261117_070100.stdata'}]) == '17 Nov 2026, 06:59:59 · X/Y pair'
+    assert automatic_title([{'filename':'untimed_X.stdata'}]) == 'untimed_X'
+    assert automatic_title([{'filename':'invalid_20269999_999999.stdata'}]) == 'invalid_20269999_999999'

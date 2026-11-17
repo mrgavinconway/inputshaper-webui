@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
+from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import FileResponse, JSONResponse
@@ -36,6 +38,8 @@ def init_db():
         c.execute('PRAGMA journal_mode=WAL')
         c.execute('CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, title TEXT, filename TEXT, created REAL, status TEXT, error TEXT, settings TEXT, view TEXT DEFAULT \'{}\')')
         c.execute('CREATE TABLE IF NOT EXISTS notes (id TEXT PRIMARY KEY, run_id TEXT, created REAL, text TEXT, measurement INTEGER, low REAL, high REAL)')
+        if 'deleted' not in {r['name'] for r in c.execute('PRAGMA table_info(runs)')}:
+            c.execute('ALTER TABLE runs ADD COLUMN deleted REAL')
         c.execute("UPDATE runs SET status='failed', error='Processing interrupted by service restart. Re-upload the original file.' WHERE status IN ('queued','processing')")
 
 def row_run(run_id):
@@ -131,9 +135,21 @@ def health():
     return {'status': 'ok', 'version': version()}
 
 @app.get('/api/runs')
-def runs():
+def runs(deleted: bool = False):
     with db() as c:
-        return [dict(r) for r in c.execute('SELECT id,title,filename,created,status,error FROM runs ORDER BY created DESC')]
+        return [dict(r) for r in c.execute('SELECT id,title,filename,created,status,error,deleted FROM runs WHERE deleted IS '+('NOT NULL' if deleted else 'NULL')+' ORDER BY created DESC')]
+
+def automatic_title(sources):
+    for source in sources:
+        match = re.search(r'(\d{8})[_-](\d{6})', source['filename'])
+        if match:
+            try:
+                stamp = datetime.strptime(''.join(match.groups()), '%Y%m%d%H%M%S')
+                return stamp.strftime('%d %b %Y, %H:%M:%S') + (' · X/Y pair' if len(sources) == 2 else '')
+            except ValueError:
+                pass
+    # No trustworthy file timestamp: retain descriptive filenames rather than inventing a test date.
+    return ' + '.join(Path(s['filename']).stem for s in sources)[:200]
 
 @app.post('/api/runs', status_code=202)
 async def upload(file: list[UploadFile] = File(...), title: str = Form(''), printer: str = Form(''),
@@ -178,7 +194,7 @@ async def upload(file: list[UploadFile] = File(...), title: str = Form(''), prin
         (folder / 'settings.json').write_text(json.dumps(settings))
         with db() as c:
             c.execute('INSERT INTO runs(id,title,filename,created,status,settings) VALUES(?,?,?,?,?,?)',
-                      (run_id, (title or filenames)[:200], filenames, time.time(), 'queued', json.dumps(settings)))
+                      (run_id, (title.strip() or automatic_title(sources))[:200], filenames, time.time(), 'queued', json.dumps(settings)))
         executor.submit(process, run_id)
         return {'id': run_id}
     except Exception:
@@ -196,6 +212,22 @@ def run(run_id: str):
     if r['status'] == 'ready':
         r['result'] = json.loads((DATA / run_id / 'result.json').read_text())
     return r
+
+@app.delete('/api/runs/{run_id}')
+def delete_run(run_id: str):
+    r = row_run(run_id)
+    if r['status'] in ('queued', 'processing'):
+        raise HTTPException(409, 'Wait for analysis to finish before deleting this import.')
+    with db() as c:
+        c.execute('UPDATE runs SET deleted=? WHERE id=?', (time.time(), run_id))
+    return {'ok': True}
+
+@app.post('/api/runs/{run_id}/restore')
+def restore_run(run_id: str):
+    row_run(run_id)
+    with db() as c:
+        c.execute('UPDATE runs SET deleted=NULL WHERE id=?', (run_id,))
+    return {'ok': True}
 
 class View(BaseModel):
     view: dict
